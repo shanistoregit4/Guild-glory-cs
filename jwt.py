@@ -17,7 +17,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # URLS & CONSTANTS
 # ============================================================
 URL_TOKEN_GRANT = "https://100067.connect.garena.com/api/v2/oauth/guest/token:grant"
-URL_MAJOR_LOGIN = "https://loginbp.mainecoonnodex.com/MajorLogin"
+URL_MAJOR_LOGIN = "https://loginbp.ppmainecoonghj.com/MajorLogin"
 URL_GET_LOGIN_DATA = "https://clientbp.ppmainecoonghj.com/GetLoginData"
 
 APP_ID        = 100067
@@ -35,7 +35,7 @@ HEADERS_MSDK = {
 }
 
 HEADERS_LOGINBP = {
-    'Host': 'loginbp.mainecoonnodex.com', 
+    'Host': 'loginbp.ppmainecoonghj.com', 
     'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)', 
     'Accept': '*/*', 
     'Accept-Encoding': 'deflate, gzip', 

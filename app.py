@@ -245,44 +245,6 @@ def _clean_body_snippet(raw, limit=200):
     return " ".join(cleaned.split())[:limit]
 
 
-def _choose_region(jwtmod, our_gen, region, jwt_token):
-    """Best-effort ChooseRegion bind with the fresh MajorLogin JWT.
-
-    Mirrors our_gen.force_region_bind exactly (same URL, same AES-encrypted
-    protobuf body field 1 = region code, same headers). Returns
-    (ok, reason): ok True only on HTTP 200.
-    """
-    try:
-        is_me_th = region.upper() in ("ME", "TH")
-        url = ("https://loginbp.common.ggbluefox.com/ChooseRegion"
-               if is_me_th
-               else "https://loginbp.mainecoonnodex.com/ChooseRegion")
-        host = ("loginbp.common.ggbluefox.com" if is_me_th
-                else "loginbp.mainecoonnodex.com")
-        region_code = "RU" if region.upper() == "CIS" else region.upper()
-        encrypted = our_gen.encrypt_api(
-            our_gen.build_proto({1: region_code}).hex())
-        headers = {
-            "Accept": "*/*",
-            "Accept-Encoding": "deflate, gzip",
-            "Authorization": f"Bearer {jwt_token}",
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Host": host,
-            "ReleaseVersion": jwtmod.RELEASE_VER,
-            "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-            "X-GA": "v1 1",
-            "X-GA-SV": str(int(time.time())),
-            "X-Unity-Version": "2018.4.12f1",
-        }
-        r = requests.post(url, data=bytes.fromhex(encrypted),
-                          headers=headers, verify=False, timeout=15)
-        if r.status_code == 200:
-            return True, ""
-        return False, f"HTTP {r.status_code}"
-    except Exception as e:  # noqa: BLE001 - best-effort only
-        return False, f"{type(e).__name__}: {e}"
-
-
 def login_account(jwtmod, our_gen, uid, password, region, guild_id, name=""):
     """Log one account in (guest uid -> token grant -> MajorLogin).
 
@@ -290,11 +252,12 @@ def login_account(jwtmod, our_gen, uid, password, region, guild_id, name=""):
     GUEST uid (not the in-game account_id), then build_major_login_payload
     + major_login, then parse_major_login_response, which returns a
     _MajorLoginResAdapter OBJECT (.token = JWT, .account_id, .url).
-    Right after MajorLogin succeeds, a ChooseRegion bind is sent with the
-    fresh JWT (same moment, same login step) — best-effort: if it fails
-    the login still succeeds and the guild join is still attempted.
+    This is the SECOND login — exactly like the emote bot, on the
+    original ppmainecoonghj.com endpoint. No ChooseRegion here: the
+    region bind already happened once, in the gen, during account
+    creation (first login, mainecoonnodex.com).
     Returns (info, error): info is the dict (account_id, jwt,
-    clientbp_url, region_bind, ...) or None; error names the failed step
+    clientbp_url, ...) or None; error names the failed step
     ("" on success). The guest uid/password live only inside the returned
     info dict — they are never logged or returned by the API.
     """
@@ -363,21 +326,6 @@ def login_account(jwtmod, our_gen, uid, password, region, guild_id, name=""):
             "clientbp_url": getattr(proto, "url", None)
                             or CLIENTBP_FALLBACK_URL,
         }
-        # ChooseRegion bind with the fresh JWT, right after MajorLogin and
-        # before the guild join. Best-effort: a failure is logged and the
-        # login still succeeds — the join is attempted anyway.
-        try:
-            bind_ok, bind_reason = _choose_region(
-                jwtmod, our_gen, region, proto.token)
-        except Exception as exc:  # noqa: BLE001 - never fail login on this
-            bind_ok, bind_reason = False, f"{type(exc).__name__}: {exc}"
-        info["region_bind"] = bind_ok
-        if bind_ok:
-            _log(f"[REGION-BIND] ID {info.get('account_id')} -> "
-                 f"{region.upper()}", guild=guild_id)
-        else:
-            _log(f"[REGION-BIND-FAIL] ID {info.get('account_id')}: "
-                 f"{bind_reason}", guild=guild_id)
         return info, ""
     except Exception as e:
         return None, f"unexpected: {e}"

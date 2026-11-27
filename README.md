@@ -29,17 +29,20 @@ author's backend. This version replaces it with **our own generator**:
   grant → MajorRegister → MajorLogin → ChooseRegion, all against Garena
   directly (loginbp.mainecoonnodex.com; ggbluefox for ME/TH). No author
   server, nothing reported to anyone.
-- `jwt.py` — our login module (MajorLogin / GetLoginData / AES). MajorLogin
-  now posts to `loginbp.mainecoonnodex.com/MajorLogin` (was
-  `loginbp.ppmainecoonghj.com`); GetLoginData is unchanged.
+- `jwt.py` — our login module (MajorLogin / GetLoginData / AES), exactly
+  like the emote bot: MajorLogin posts to
+  `loginbp.ppmainecoonghj.com/MajorLogin`; GetLoginData is unchanged.
+  (The gen's own MajorLogin is the one on
+  `loginbp.mainecoonnodex.com` — see `our_gen.py` above. Two logins,
+  two endpoints, by design.)
 - Guild join is our own `RequestJoinClan` (AES-CBC protobuf
   `{f1=guild_id, f2="PK"}`, Bearer JWT). After an account is generated, the
   dashboard does a **fresh login** for it (token grant with the guest uid
-  → MajorLogin via jwt.py → parse), which yields the real in-game
-  `account_id`, a fresh JWT, and the account's **own clientbp URL**; right
-  after MajorLogin, a **ChooseRegion** bind is sent with the fresh JWT
-  (same login step, best-effort — a failure is logged as
-  `[REGION-BIND-FAIL]` and the join is still attempted). The join then
+  → MajorLogin via jwt.py on the original ppmainecoonghj.com endpoint,
+  exactly like the emote bot → parse), which yields the real in-game
+  `account_id`, a fresh JWT, and the account's **own clientbp URL**.
+  No ChooseRegion here — the region bind already happened once, in the
+  gen, during account creation. The join then
   POSTs to the account's own clientbp URL. The generation-time token is
   never reused and the clientbp URL is never hardcoded (a fixed URL is
   only a fallback if MajorLogin returns none). HTTP 200 is the only real
