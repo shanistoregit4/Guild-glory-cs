@@ -23,14 +23,33 @@ THE FLOW — the ORIGINAL BD bot, with only account creation replaced:
   per account, the bot's own worker `lIIIllIIIlllIIl`
   (uid, password, region_override, clan_override, squad_id) does its
   combined login (its own version check + token grant + MajorLogin +
-  GetLoginData), then its post-login driver (lobby TCP auth, UDP/match
-  join, its own guild join `lllIIIIll`, TCP auth again), then its
-  follow-up call, and plays/idles to the match end. The dashboard
-  does NOT re-implement any of that: no rewritten login, no rewritten
+  GetLoginData), then its post-login driver in the ORIGINAL order —
+  UDP setup (bd_bot.py line 27810), lobby TCP auth FIRST
+  (line 27834), then its own guild join `lllIIIIll` (line 27948),
+  TCP auth again (line 27972) — then its follow-up call, and
+  plays/idles to the match end. So the flow is: login -> FIRST TCP
+  connect -> guild join -> match start -> play. The dashboard does
+  NOT re-implement any of that: no rewritten login, no rewritten
   guild join, no rewritten match/team/UDP code, no guessed values.
   The dashboard only wraps it: the form replaces the terminal prompts
-  (team size / guild IDs / region), the bot's printed output is captured
-  into the same log ring buffer, and per-guild stop cancels its workers.
+  (number of teams / guild IDs / region), the bot's printed output is
+  captured into the same log ring buffer, and per-guild stop cancels
+  its workers.
+- The first lobby TCP auth is made VISIBLE (it prints nothing on its
+  own): app.py wraps the bot's TCP-auth function
+  (bd_bot.IIIIIllIIllIl) with a thin observer that only logs
+  "[TCP-CONNECT] ID <account_id>" the first time an account's TCP
+  auth returns successfully. The wrapper calls the original
+  unchanged, returns its result unchanged, and re-raises its
+  exceptions unchanged; bd_bot.py stays byte-identical. The bot's
+  own guild-join print ("[GUILD ...] Clan join sent") comes after
+  it in the log, so the order TCP -> guild join is visible.
+- Teams: a CS squad is 4 players, so the form asks for the NUMBER OF
+  TEAMS (1-10, default 1); total members = teams x 4. The bot's own
+  squad helper (bd_bot.IIIllIlIlllII, called with preferred_index =
+  the account's global index) returns squad = index // 4, so the
+  first 4 accounts are team 1 (squad 0), the next 4 are team 2
+  (squad 1), and so on. Each team's 4 workers run as that squad.
 - jwt.py is kept in the folder (original login module, ppmainecoonghj.com,
   like the emote bot) but is NOT used by the run path anymore — the
   original bot does its own login. The dashboard's old login_account /
@@ -74,9 +93,12 @@ PASSWORD_PREFIX = "pak"
 GEN_WORKERS = 70
 # Stop a guild after this many consecutive generation failures.
 MAX_CONSEC_FAILURES = 10
+# A CS squad is 4 players: the form asks for the NUMBER OF TEAMS
+# (1-10, default 1); total members created per guild = teams x 4.
+TEAM_MEMBERS = 4
+MAX_TEAMS = 10
 
 LOG_MAX = 100
-MAX_TEAM_SIZE = 100
 MAX_GUILDS = 10
 
 app = Flask(__name__)
@@ -272,12 +294,75 @@ def get_bd_bot():
                 raise RuntimeError("bd_bot has no squad helper IIIllIlIlllII")
             _bd_bot = mod
             _log("[dashboard] original BD bot imported OK")
+            _install_tcp_auth_observer(_bd_bot)
             return _bd_bot
         except BaseException as exc:  # noqa: BLE001 - includes SystemExit from the bot's net check
             _bd_bot_error = exc
             raise RuntimeError(
                 f"original BD bot failed to import: {type(exc).__name__}: {exc}"
             ) from exc
+
+
+# ---------------------------------------------------------------------------
+# First-TCP-connect observer (Change 1 — makes the order VISIBLE).
+#
+# Verified in the ORIGINAL bot's post-login driver (bd_bot.py):
+#   line 27810  UDP setup call
+#   line 27834  TCP auth #1 (lobby/online TCP auth, 0x83-style)
+#   line 27948  guild join (lllIIIIll)
+#   line 27972  TCP auth #2 (same function)
+# So the original ALREADY does the FIRST TCP connect BEFORE the guild
+# join. The order is NOT changed. But the TCP auth prints nothing on
+# success (0 print calls in lines 16415-16600 and in the driver), so
+# the dashboard cannot see it from the bot's own output. This thin
+# observer is the only way to make it visible WITHOUT touching the
+# bot: it wraps bd_bot.IIIIIllIIllIl (the module global the driver
+# resolves by bare name at lines 27834/27972) in app.py only.
+# The wrapper calls the original unchanged, returns its result
+# unchanged, and re-raises its exceptions unchanged. It only adds one
+# log line: the FIRST time a given account_id's TCP auth returns
+# successfully, "[TCP-CONNECT] ID <account_id>". The driver calls the
+# TCP auth twice per account (before and after the guild join); the
+# dedup set keeps only the first, so the log shows TCP-CONNECT and
+# then the bot's own "[GUILD ...] Clan join sent" line after it.
+# bd_bot.py stays byte-identical. The wrapper is installed once.
+# ---------------------------------------------------------------------------
+
+_tcp_auth_orig = None          # the bot's original IIIIIllIIllIl
+_tcp_connected = set()         # account_ids already logged as TCP-CONNECT
+_tcp_connected_lock = threading.Lock()
+
+
+async def _tcp_auth_observer(*args, **kwargs):
+    """Observe the bot's lobby TCP auth; log the first success per account.
+
+    account_id is the first positional arg
+    (IlllIIIIIIlIIIII(account_id, token, server_time, key, iv, ...)).
+    Success = the awaited call returns without raising (the driver does
+    not check the return value before the guild join — it just awaits
+    and moves on — so a clean return is what the driver itself treats
+    as connected)."""
+    result = await _tcp_auth_orig(*args, **kwargs)
+    account_id = str(args[0]) if args else "?"
+    with _tcp_connected_lock:
+        first = account_id not in _tcp_connected
+        if first:
+            _tcp_connected.add(account_id)
+    if first:
+        _log(f"[TCP-CONNECT] ID {account_id}")
+    return result
+
+
+def _install_tcp_auth_observer(bd_bot):
+    """Install _tcp_auth_observer as bd_bot.IIIIIllIIllIl (once)."""
+    global _tcp_auth_orig
+    if _tcp_auth_orig is not None:
+        return  # already installed
+    orig = getattr(bd_bot, "IIIIIllIIllIl", None)
+    if orig is None:
+        return  # bot has no such function; nothing to observe
+    _tcp_auth_orig = orig
+    bd_bot.IIIIIllIIllIl = _tcp_auth_observer
 
 
 # ---------------------------------------------------------------------------
@@ -288,19 +373,24 @@ def _run_bd_workers(bd_bot, accounts, region, guild_id, stop_event):
     """Hand every generated account to the ORIGINAL BD bot's own worker
     and run them all.
 
-    Per account (i-th of the guild's team), exactly like the original
-    create path's join phase:
+    Per account (i-th of the guild's accounts), exactly like the original
+    create path's join phase (bd_bot.py line 30473):
       squad_id = bd_bot.IIIllIlIlllII(uid, preferred_index=i)
       bd_bot.lIIIllIIIlllIIl(uid, password,
                              region_override=region,
                              clan_override=guild_id,
                              squad_id=squad_id)
+    The helper returns squad = i // 4 (verified by calling it: indices
+    0-3 -> squad 0, 4-7 -> squad 1), so the first 4 accounts run as
+    team 1 (squad 0), the next 4 as team 2 (squad 1), and so on.
     Workers are launched as asyncio tasks 0.25s apart (the original's
     gap) and gathered, in one event loop in this (guild) thread. The
-    worker itself does the combined login (its own version check +
-    token grant + MajorLogin + GetLoginData), then its post-login driver
-    (lobby TCP auth, UDP/match join, its own guild join, TCP auth
+    worker itself does the combined login, then its post-login driver
+    (UDP setup, lobby TCP auth FIRST, its own guild join, TCP auth
     again), then its follow-up call, and plays/idles to the match end.
+    One worker raising does not stop the others (gather with
+    return_exceptions=True), so one team's failure never stops the
+    other teams of the same guild.
 
     Returns the gather result list: None per worker that finished,
     the exception object per worker that raised (including
@@ -396,16 +486,20 @@ def _counting_log_line(line, guild=None):
 log_line = _counting_log_line
 
 
-def _run_guild(guild_id, team_size, region):
+def _run_guild(guild_id, teams, region):
     """One guild, in its own thread:
-    1. Generate team_size accounts with OUR generator (70 workers, waves)
+    1. Generate teams x 4 accounts with OUR generator (70 workers, waves)
        and log [CREATED] per account (real in-game account_id from our
-       gen's own MajorLogin).
+       gen's own MajorLogin). The 4 accounts of team 1 are created
+       first, then team 2's 4, and so on.
     2. Hand every created account to the ORIGINAL BD bot's worker
-       (login + guild join + match join + play), exactly like the
-       original create path's join phase. The bot's own printed output
-       flows into this guild's log.
-    Runs one thread per guild, so multiple guilds run in parallel."""
+       (login -> FIRST TCP connect -> guild join -> match start -> play),
+       exactly like the original create path's join phase. The bot's
+       own printed output flows into this guild's log.
+    Runs one thread per guild, so multiple guilds run in parallel.
+    All teams of one guild share this thread (one event loop), so
+    stopping the guild stops ALL its teams."""
+    total = teams * TEAM_MEMBERS  # total members = teams x 4
     with _thread_guild_lock:
         _thread_guild[threading.get_ident()] = guild_id
     stop_event = threading.Event()
@@ -417,8 +511,9 @@ def _run_guild(guild_id, team_size, region):
     try:
         our_gen = get_gen()
         bd_bot = get_bd_bot()
-        _log(f"[{guild_id}] starting: {team_size} accounts, region {region} "
-             f"(our generator, 70 workers; original BD bot for login/join/match)",
+        _log(f"[{guild_id}] starting: {teams} team(s) x {TEAM_MEMBERS} = "
+             f"{total} accounts, region {region} "
+             f"(our generator, 70 workers; original BD bot for login/TCP/guild join/match)",
              guild=guild_id)
         # Generation waves: each wave submits up to 70 generation attempts
         # (never more than the accounts still needed), waits for them all,
@@ -426,8 +521,8 @@ def _run_guild(guild_id, team_size, region):
         # This mirrors the original's creation loop (create all accounts
         # first, join phase after) — accounts are only handed to the bot
         # once generation is done.
-        while created < team_size and not stop_event.is_set():
-            remaining = team_size - created
+        while created < total and not stop_event.is_set():
+            remaining = total - created
             batch = min(GEN_WORKERS, remaining)
             ex = ThreadPoolExecutor(max_workers=GEN_WORKERS)
             try:
@@ -456,7 +551,12 @@ def _run_guild(guild_id, team_size, region):
                     consecutive_failures = 0
                     created += 1
                     accounts.append(acc)
-                    _log(f"[CREATED] Bot {created}/{team_size} | "
+                    # Team (1-based) of the just-created account: the first
+                    # 4 created are team 1, the next 4 team 2, and so on.
+                    # This matches the bot's own squad helper, which
+                    # returns squad = global_index // 4 (team index).
+                    team_no = (created - 1) // TEAM_MEMBERS + 1
+                    _log(f"[CREATED] Bot {created}/{total} | Team {team_no} | "
                          f"ID: {acc.get('account_id', '?')}", guild=guild_id)
             finally:
                 # On stop, drop queued futures immediately; running attempts
@@ -468,8 +568,12 @@ def _run_guild(guild_id, team_size, region):
         # instead of this block). --
         if not stop_event.is_set() and accounts:
             _set_match_stage(guild_id, "joining")
-            _log(f"[{guild_id}] handing {len(accounts)} account(s) to the "
-                 f"original BD bot worker (login + guild join + match)",
+            # Squads are 0..teams-1 (the bot's helper returns
+            # squad = global_index // 4, so team t runs as squad t-1).
+            squad_list = ", ".join(str(t) for t in range(teams))
+            _log(f"[{guild_id}] handing {len(accounts)} account(s) in "
+                 f"{teams} team(s) (squads {squad_list}) to the original "
+                 f"BD bot worker (login -> TCP -> guild join -> match)",
                  guild=guild_id)
             try:
                 results = _run_bd_workers(bd_bot, accounts, region,
@@ -521,11 +625,11 @@ def _run_guild(guild_id, team_size, region):
                 if stop_event.is_set():
                     g["state"] = "stopped"
                     _log(f"[{guild_id}] stopped by user "
-                         f"({created}/{team_size} created)", guild=guild_id)
+                         f"({created}/{total} created)", guild=guild_id)
                 else:
                     g["state"] = "done"
-                    _log(f"[{guild_id}] done: {created}/{team_size} created",
-                         guild=guild_id)
+                    _log(f"[{guild_id}] done: {created}/{total} created "
+                         f"({teams} team(s))", guild=guild_id)
                 g["ended_at"] = _now_iso()
     except _GuildFailed as exc:
         with _guilds_lock:
@@ -560,12 +664,22 @@ def index():
 def api_start():
     data = request.get_json(silent=True) or {}
     # ---- validate ----
+    # teams: number of teams per guild (each team = 4 members, a CS squad).
+    # Must be a whole number 1-10. Anything else is rejected with a
+    # clear error — never silently clamped or defaulted.
+    raw_teams = data.get("teams")
+    if isinstance(raw_teams, bool) or not isinstance(raw_teams, (int, str)):
+        return jsonify({"ok": False,
+                        "error": "teams must be a whole number (1-10)"}), 400
     try:
-        team_size = int(data.get("team_size", 0))
+        teams = int(str(raw_teams).strip())
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "team_size must be a number"}), 400
-    if team_size < 1 or team_size > MAX_TEAM_SIZE:
-        return jsonify({"ok": False, "error": f"team_size must be between 1 and {MAX_TEAM_SIZE}"}), 400
+        return jsonify({"ok": False,
+                        "error": "teams must be a whole number (1-10)"}), 400
+    if teams < 1 or teams > MAX_TEAMS:
+        return jsonify({"ok": False,
+                        "error": f"teams must be between 1 and {MAX_TEAMS} "
+                                 f"(each team has {TEAM_MEMBERS} members)"}), 400
 
     raw_ids = data.get("guild_ids", [])
     if isinstance(raw_ids, str):
@@ -608,8 +722,10 @@ def api_start():
             _guilds[gid] = {
                 "guild_id": gid,
                 "state": "running",
+                "teams": teams,
+                "members_per_team": TEAM_MEMBERS,
                 "created": 0,
-                "total": team_size,
+                "total": teams * TEAM_MEMBERS,
                 "started_at": _now_iso(),
                 "ended_at": None,
                 "error": None,
@@ -626,7 +742,7 @@ def api_start():
             started.append(gid)
 
     for gid in started:
-        t = threading.Thread(target=_run_guild, args=(gid, team_size, region),
+        t = threading.Thread(target=_run_guild, args=(gid, teams, region),
                              name=f"gen-{gid}", daemon=True)
         with _guilds_lock:
             _guilds[gid]["thread"] = t
@@ -642,10 +758,21 @@ def api_status():
         for gid, g in _guilds.items():
             if g.get("hidden"):
                 continue
+            # Per-team created counts: team t (0-based) has
+            # min(4, max(0, created - t*4)) members created so far.
+            created = g["created"]
+            teams = g.get("teams", 1)
+            mpt = g.get("members_per_team", TEAM_MEMBERS)
+            team_created = [max(0, min(mpt, created - t * mpt))
+                            for t in range(teams)]
             out.append({
                 "guild_id": gid,
                 "state": g["state"],
-                "created": g["created"],
+                "teams": teams,
+                "members_per_team": mpt,
+                "members": g["total"],
+                "created": created,
+                "team_created": team_created,
                 "total": g["total"],
                 "started_at": g["started_at"],
                 "ended_at": g["ended_at"],

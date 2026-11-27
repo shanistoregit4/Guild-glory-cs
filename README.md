@@ -6,7 +6,10 @@ prompts, no Skip option — everything runs from the dashboard.
 
 ## What it does
 
-- **Team size** — how many accounts to create per guild (1–100, default 4).
+- **Number of teams** — how many teams to run per guild (1–10, default 1).
+  A CS squad is 4 players, so 1 team = 4 members, 2 teams = 8 members,
+  N teams = N × 4 members. The team count is editable; the squad size
+  (4) is fixed.
 - **Guild IDs** — one per line; multiple guilds run **in parallel**, each with
   its own progress card.
 - **Region** — BD or IND (passed to the generator; name prefix `shani`,
@@ -14,12 +17,13 @@ prompts, no Skip option — everything runs from the dashboard.
 - **Live log** — the last 100 lines, streamed in real time (Server-Sent Events),
   auto-scrolling, tagged per guild. The original bot's own printed output
   flows into this log.
-- **Per-guild progress** — created/total with a progress bar, state
-  (running / done / error / stopped), and the worker stage
-  (`creating` → `joining` → `done` / `stopped` / `error`).
+- **Per-guild progress** — teams, members, created/total with a progress bar,
+  per-team created counts, state (running / done / error / stopped), and the
+  worker stage (`creating` → `joining` → `done` / `stopped` / `error`).
 - **Stop all** — cancels every running guild task.
-- **Remove (✕) on each guild card** — stops and removes just that one guild;
-  other guilds keep running. Also removes finished guilds from the view.
+- **Remove (✕) on each guild card** — stops and removes just that one guild
+  (all its teams); other guilds keep running. Also removes finished guilds
+  from the view.
 
 ## The flow — ORIGINAL BD bot, only creation replaced
 
@@ -39,30 +43,53 @@ The dashboard is a wrapper. It does not re-implement any bot logic.
    `data_pb2.py`, `StartMatch_pb2.py`, `thunderFF_pb2.py`,
    `homor_rudp.py`) are imported unchanged. Per account the dashboard
    calls the bot's own per-account worker, exactly like the original
-   create path's join phase:
+   create path's join phase (bd_bot.py line 30473):
    - `squad_id = bd_bot.IIIllIlIlllII(uid, preferred_index=i)`
    - `bd_bot.lIIIllIIIlllIIl(uid, password, region_override=region,
      clan_override=guild_id, squad_id=squad_id)`
-   
+
+   The squad helper returns squad = index // 4 (verified by calling
+   it: indices 0-3 → squad 0, 4-7 → squad 1), so the first 4 accounts
+   run as team 1 (squad 0), the next 4 as team 2 (squad 1), and so on.
+   Each team's 4 workers run as that squad, all teams of a guild in
+   parallel in the same event loop; one team's failure never stops
+   the other teams (gather with return_exceptions=True).
+
    Workers are launched as asyncio tasks 0.25 s apart (the original's
    gap) and gathered, in one event loop per guild thread. The worker
    does its combined login (its own version check against
    version.ggwhitehawk.com, token grant, MajorLogin, GetLoginData),
-   then its post-login driver (lobby TCP auth, UDP/match join, its own
-   guild join `lllIIIIll`, TCP auth again), then its follow-up call,
-   and plays/idles to the match end. The Vercel wrapper is never called
-   from this path — it only exists in the original's separate join
-   helper, which the dashboard does not call.
-3. **Guild join is the original bot's own.** There is no dashboard
-   login, no dashboard guild join, and no dashboard match code anymore.
-   The old `login_account` / `guild_join` (and their HTTP-400 rule)
-   were deleted with the rewrite they belonged to. Join success/failure
-   is whatever the original bot prints in the log. The dashboard only
-   logs `[CREATED] Bot n/total | ID: <in-game account_id>` from our
-   gen's own MajorLogin, and tracks how many worker tasks ran to
-   completion (`matched` on the card — the worker returns None whether
-   its login/join/match succeeded or failed, so the real per-account
-   outcome is in the original bot's own log lines).
+   then its post-login driver in the ORIGINAL order, verified by
+   reading bd_bot.py (post-login driver, inner at line 27689):
+   UDP setup (line 27810) → **lobby TCP auth FIRST (line 27834)** →
+   **its own guild join `lllIIIIll` (line 27948)** → TCP auth again
+   (line 27972) — then its follow-up call, and plays/idles to the
+   match end. So the flow is: login → FIRST TCP connect → guild join
+   → match start → play. The order was NOT changed; it is the
+   original's own.
+   The first TCP connect is made visible in the log: the TCP auth
+   prints nothing on its own, so app.py wraps the bot's TCP-auth
+   function (`bd_bot.IIIIIllIIllIl`) with a thin observer that only
+   logs `[TCP-CONNECT] ID <account_id>` the first time an account's
+   TCP auth returns successfully. The wrapper calls the original
+   unchanged and returns its result unchanged; bd_bot.py stays
+   byte-identical. The bot's own guild-join print
+   (`[GUILD ...] Clan join sent`) comes after it in the log.
+   The Vercel wrapper is never called from this path — it only exists
+   in the original's separate join helper, which the dashboard does
+   not call.
+3. **Guild join is the original bot's own, after the first TCP
+   connect.** There is no dashboard login, no dashboard guild join,
+   and no dashboard match code anymore. The old `login_account` /
+   `guild_join` (and their HTTP-400 rule) were deleted with the
+   rewrite they belonged to. Join success/failure is whatever the
+   original bot prints in the log. The dashboard only logs
+   `[CREATED] Bot n/total | Team t | ID: <in-game account_id>` from
+   our gen's own MajorLogin, `[TCP-CONNECT] ID: <account_id>` when an
+   account's first lobby TCP auth succeeds, and tracks how many worker
+   tasks ran to completion (`matched` on the card — the worker returns
+   None whether its login/join/match succeeded or failed, so the real
+   per-account outcome is in the original bot's own log lines).
 4. **Stop** — a per-guild stop cancels the running worker tasks
    (bounded 30 s wait for them to unwind) and marks the guild stopped.
 
@@ -110,12 +137,13 @@ rebuilds from the Dockerfile, so the deleted files do not linger.)
 
 ## Use the dashboard
 
-1. Enter **Team size** (accounts per guild).
+1. Enter **Number of teams** (1–10; each team is 4 members, so 2 teams
+   = 8 members running for the guild).
 2. Paste **Guild IDs**, one per line.
 3. Pick **Region** (BD / IND).
 4. Press **Start**. Each guild gets its own progress card; the log streams live.
 5. Press **Stop all** to cancel running guilds, or **✕ Remove** on one card
-   to stop and remove just that guild.
+   to stop and remove just that guild (all its teams).
 
 ## Run locally (optional)
 
@@ -154,3 +182,14 @@ python app.py          # dashboard at http://127.0.0.1:5000
 - The worker's internals (login URLs, guild-join host, match join,
   movement) are the original's own and are not re-verified here — the
   dashboard runs them, it does not claim them.
+- Order note: the driver's UDP setup call (line 27810) comes before
+  the first TCP auth (line 27834); its purpose for that specific call
+  is unproven (it takes addresses + a starter packet, so it reads as
+  lobby-connection setup, not the match start — the match join chain
+  B → D runs later, after the guild join). The TCP → guild-join order
+  itself is verified by line number (27834 < 27948).
+- The `[TCP-CONNECT]` line comes from the app.py observer wrapper
+  around the bot's TCP-auth function, not from the bot itself — the
+  bot prints nothing on TCP success. If the wrapper ever fails to
+  install (bot has no such function), the run still works; the log
+  just won't show the TCP line.
