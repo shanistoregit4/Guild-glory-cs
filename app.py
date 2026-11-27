@@ -232,17 +232,71 @@ def _pad(data):
     return data + bytes([pad_len]) * pad_len
 
 
-def login_account(jwtmod, uid, password, name=""):
+def _clean_body_snippet(raw, limit=200):
+    """First `limit` chars of a response body, printable only, one line."""
+    if raw is None:
+        return ""
+    if isinstance(raw, (bytes, bytearray)):
+        text = bytes(raw).decode("utf-8", errors="replace")
+    else:
+        text = str(raw)
+    cleaned = "".join(ch if ch.isprintable() or ch in "\n\t" else " "
+                      for ch in text)
+    return " ".join(cleaned.split())[:limit]
+
+
+def _choose_region(jwtmod, our_gen, region, jwt_token):
+    """Best-effort ChooseRegion bind with the fresh MajorLogin JWT.
+
+    Mirrors our_gen.force_region_bind exactly (same URL, same AES-encrypted
+    protobuf body field 1 = region code, same headers). Returns
+    (ok, reason): ok True only on HTTP 200.
+    """
+    try:
+        is_me_th = region.upper() in ("ME", "TH")
+        url = ("https://loginbp.common.ggbluefox.com/ChooseRegion"
+               if is_me_th
+               else "https://loginbp.mainecoonnodex.com/ChooseRegion")
+        host = ("loginbp.common.ggbluefox.com" if is_me_th
+                else "loginbp.mainecoonnodex.com")
+        region_code = "RU" if region.upper() == "CIS" else region.upper()
+        encrypted = our_gen.encrypt_api(
+            our_gen.build_proto({1: region_code}).hex())
+        headers = {
+            "Accept": "*/*",
+            "Accept-Encoding": "deflate, gzip",
+            "Authorization": f"Bearer {jwt_token}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Host": host,
+            "ReleaseVersion": jwtmod.RELEASE_VER,
+            "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+            "X-GA": "v1 1",
+            "X-GA-SV": str(int(time.time())),
+            "X-Unity-Version": "2018.4.12f1",
+        }
+        r = requests.post(url, data=bytes.fromhex(encrypted),
+                          headers=headers, verify=False, timeout=15)
+        if r.status_code == 200:
+            return True, ""
+        return False, f"HTTP {r.status_code}"
+    except Exception as e:  # noqa: BLE001 - best-effort only
+        return False, f"{type(e).__name__}: {e}"
+
+
+def login_account(jwtmod, our_gen, uid, password, region, guild_id, name=""):
     """Log one account in (guest uid -> token grant -> MajorLogin).
 
     Proven flow copied from guild_join_from_file.py: token grant with the
     GUEST uid (not the in-game account_id), then build_major_login_payload
     + major_login, then parse_major_login_response, which returns a
     _MajorLoginResAdapter OBJECT (.token = JWT, .account_id, .url).
+    Right after MajorLogin succeeds, a ChooseRegion bind is sent with the
+    fresh JWT (same moment, same login step) — best-effort: if it fails
+    the login still succeeds and the guild join is still attempted.
     Returns (info, error): info is the dict (account_id, jwt,
-    clientbp_url, ...) or None; error names the failed step ("" on success).
-    The guest uid/password live only inside the returned info dict — they
-    are never logged or returned by the API.
+    clientbp_url, region_bind, ...) or None; error names the failed step
+    ("" on success). The guest uid/password live only inside the returned
+    info dict — they are never logged or returned by the API.
     """
     try:
         dev_id = f"02-{uuid.uuid4()}"
@@ -309,6 +363,21 @@ def login_account(jwtmod, uid, password, name=""):
             "clientbp_url": getattr(proto, "url", None)
                             or CLIENTBP_FALLBACK_URL,
         }
+        # ChooseRegion bind with the fresh JWT, right after MajorLogin and
+        # before the guild join. Best-effort: a failure is logged and the
+        # login still succeeds — the join is attempted anyway.
+        try:
+            bind_ok, bind_reason = _choose_region(
+                jwtmod, our_gen, region, proto.token)
+        except Exception as exc:  # noqa: BLE001 - never fail login on this
+            bind_ok, bind_reason = False, f"{type(exc).__name__}: {exc}"
+        info["region_bind"] = bind_ok
+        if bind_ok:
+            _log(f"[REGION-BIND] ID {info.get('account_id')} -> "
+                 f"{region.upper()}", guild=guild_id)
+        else:
+            _log(f"[REGION-BIND-FAIL] ID {info.get('account_id')}: "
+                 f"{bind_reason}", guild=guild_id)
         return info, ""
     except Exception as e:
         return None, f"unexpected: {e}"
@@ -318,11 +387,14 @@ def guild_join(jwtmod, info, guild_id):
     """Send RequestJoinClan for one freshly logged-in account.
 
     info: the dict from login_account() above (has jwt, clientbp_url).
-    Returns (ok, status): ok True on HTTP 200; status is the HTTP code or
-    an error string. HTTP 400 = already in that guild (harmless).
+    Returns (ok, status, detail): ok True ONLY on HTTP 200; status is the
+    HTTP code or an error string; detail is a cleaned snippet of the
+    response body (decrypted when possible) so the real reason for a
+    failure is visible. A 400 is NOT assumed to mean "already in guild"
+    — the caller checks `detail` for an already-in-guild marker first.
     """
     if not info or not info.get("jwt"):
-        return False, "no jwt"
+        return False, "no jwt", ""
     proto = b"\x08" + _varint(int(guild_id)) + b"\x12\x02PK"
     body = AES.new(jwtmod.AES_KEY, AES.MODE_CBC, jwtmod.AES_IV).encrypt(
         _pad(proto))
@@ -338,9 +410,22 @@ def guild_join(jwtmod, info, guild_id):
     try:
         r = requests.post(info["clientbp_url"] + "/RequestJoinClan",
                           data=body, headers=headers, timeout=20)
-        return (r.status_code == 200), r.status_code
+        if r.status_code == 200:
+            return True, 200, ""
+        detail = _clean_body_snippet(r.content)
+        # The error body may be AES-encrypted protobuf — try decrypting
+        # it with the static key/IV to expose any readable error text.
+        try:
+            dec = jwtmod.dec_aes(r.content)
+            dec_text = _clean_body_snippet(dec)
+            if dec_text and dec_text not in detail:
+                detail = (f"{detail} | decrypted: {dec_text}"
+                          if detail else dec_text)
+        except Exception:
+            pass
+        return False, r.status_code, detail or "(empty body)"
     except Exception as e:  # noqa: BLE001 - report as a join failure
-        return False, str(e)
+        return False, str(e), ""
 
 
 class _GuildFailed(Exception):
@@ -436,7 +521,8 @@ def _run_guild(guild_id, team_size, region):
                     # displayed, logged, or tracked anywhere.
                     gen_account_id = acc.get("account_id", "?")
                     info, login_err = login_account(
-                        jwtmod, acc.get("uid"), acc.get("password"))
+                        jwtmod, our_gen, acc.get("uid"), acc.get("password"),
+                        region, guild_id)
                     if not info:
                         _log(f"[CREATED] Bot {created}/{team_size} | "
                              f"ID: {gen_account_id}", guild=guild_id)
@@ -448,16 +534,24 @@ def _run_guild(guild_id, team_size, region):
                          f"ID: {account_id}", guild=guild_id)
                     # Join this account to the guild. A join failure does
                     # NOT stop generation of the remaining accounts.
-                    ok, status = guild_join(jwtmod, info, guild_id)
+                    # A 400 is only "already in guild" when the response
+                    # body actually says so — a brand-new account cannot
+                    # already be in the guild, so any other 400 is a real
+                    # failure and its body is shown instead of a lie.
+                    ok, status, detail = guild_join(jwtmod, info, guild_id)
                     if ok:
                         _log(f"[JOINED] ID {account_id} -> guild {guild_id}",
                              guild=guild_id)
-                    elif status == 400:
+                    elif status == 400 and "already" in str(detail).lower():
                         _log(f"[JOINED] ID {account_id} -> guild {guild_id} "
                              f"(already in guild)", guild=guild_id)
-                    else:
+                    elif status == 400:
                         _log(f"[JOIN-FAIL] ID {account_id} -> guild "
-                             f"{guild_id}: {status}", guild=guild_id)
+                             f"{guild_id}: HTTP 400: {detail}", guild=guild_id)
+                    else:
+                        suffix = f": {detail}" if detail else ""
+                        _log(f"[JOIN-FAIL] ID {account_id} -> guild "
+                             f"{guild_id}: {status}{suffix}", guild=guild_id)
             finally:
                 # On stop, drop queued futures immediately; running attempts
                 # finish in the background and their results are discarded.

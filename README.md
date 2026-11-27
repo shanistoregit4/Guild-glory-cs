@@ -26,19 +26,29 @@ check against the author's server and reported every created account to the
 author's backend. This version replaces it with **our own generator**:
 
 - `our_gen.py` — our `fast_gen.py`, unchanged: guest register → Garena token
-  grant → MajorRegister → MajorLogin → GetLoginData, all against Garena
-  directly. No author server, nothing reported to anyone.
-- `jwt.py` — our login module (MajorLogin / GetLoginData / AES), unchanged.
+  grant → MajorRegister → MajorLogin → ChooseRegion, all against Garena
+  directly (loginbp.mainecoonnodex.com; ggbluefox for ME/TH). No author
+  server, nothing reported to anyone.
+- `jwt.py` — our login module (MajorLogin / GetLoginData / AES). MajorLogin
+  now posts to `loginbp.mainecoonnodex.com/MajorLogin` (was
+  `loginbp.ppmainecoonghj.com`); GetLoginData is unchanged.
 - Guild join is our own `RequestJoinClan` (AES-CBC protobuf
   `{f1=guild_id, f2="PK"}`, Bearer JWT). After an account is generated, the
   dashboard does a **fresh login** for it (token grant with the guest uid
   → MajorLogin via jwt.py → parse), which yields the real in-game
-  `account_id`, a fresh JWT, and the account's **own clientbp URL**; the
-  join POSTs to that URL. The generation-time token is never reused and
-  the clientbp URL is never hardcoded (a fixed URL is only a fallback if
-  MajorLogin returns none). HTTP 400 = already in that guild, treated as
-  joined. A failed fresh login is logged as `[LOGIN-FAIL]` and the join is
-  skipped for that account, but the account still counts as created.
+  `account_id`, a fresh JWT, and the account's **own clientbp URL**; right
+  after MajorLogin, a **ChooseRegion** bind is sent with the fresh JWT
+  (same login step, best-effort — a failure is logged as
+  `[REGION-BIND-FAIL]` and the join is still attempted). The join then
+  POSTs to the account's own clientbp URL. The generation-time token is
+  never reused and the clientbp URL is never hardcoded (a fixed URL is
+  only a fallback if MajorLogin returns none). HTTP 200 is the only real
+  join success. HTTP 400 counts as "already in guild" **only when the
+  response body actually says so** — any other 400 is logged as
+  `[JOIN-FAIL] ... HTTP 400: <body snippet>` with the real reason shown,
+  never as a false join. A failed fresh login is logged as `[LOGIN-FAIL]`
+  and the join is skipped for that account, but the account still counts
+  as created.
 - Each guild runs with **70 workers**. A failed attempt is retried; a guild
   stops with an error after 10 consecutive failures. A join failure never
   stops generation of the remaining accounts.
