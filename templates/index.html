@@ -47,6 +47,7 @@
   .bar { height: 10px; background: #0d1117; border-radius: 6px; margin-top: 10px; overflow: hidden; }
   .bar > div { height: 100%; background: var(--green); width: 0%; transition: width .4s; }
   .guild .meta { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
   .guild .err { font-size: 12px; color: var(--red); margin-top: 6px; word-break: break-word; }
   .rmv { background: none; border: 1px solid var(--border); color: var(--muted); padding: 2px 9px; font-size: 12px; border-radius: 6px; cursor: pointer; flex: none; }
   .rmv:hover { color: var(--red); border-color: var(--red); }
@@ -72,8 +73,9 @@
     <h2>Start a run</h2>
     <div class="row">
       <div>
-        <label for="teamSize">Team size (accounts per guild)</label>
-        <input type="number" id="teamSize" value="4" min="1" max="100">
+        <label for="teams">Number of teams (4 members per team)</label>
+        <input type="number" id="teams" value="1" min="1" max="10">
+        <div class="hint" id="teamsHint">1 team = 4 members running for the guild</div>
       </div>
       <div>
         <label for="region">Region</label>
@@ -147,6 +149,11 @@ function renderGuilds(guilds) {
   }
   guildList.innerHTML = guilds.map(g => {
     const pct = g.total ? Math.round(g.created / g.total * 100) : 0;
+    const teams = g.teams || 1;
+    const mpt = g.members_per_team || 4;
+    const members = g.members || g.total || 0;
+    const teamBits = (g.team_created || []).map((c, i) =>
+      "Team " + (i + 1) + ": " + c + "/" + mpt).join(" · ");
     return `<div class="guild" data-gid="${esc(g.guild_id)}">
       <div class="top">
         <span class="gid">${esc(g.guild_id)}</span>
@@ -156,7 +163,10 @@ function renderGuilds(guilds) {
         </span>
       </div>
       <div class="bar"><div style="width:${pct}%"></div></div>
-      <div class="meta">${g.created} / ${g.total} created (${pct}%) &nbsp;·&nbsp; started ${esc(g.started_at || "")}</div>
+      <div class="meta">Teams: ${teams} &nbsp;·&nbsp; Members: ${members} &nbsp;·&nbsp; Created: ${g.created} / ${g.total} (${pct}%) &nbsp;·&nbsp; match: ${esc(g.match_stage || "—")}${g.matched ? " (" + g.matched + " joined)" : ""} &nbsp;·&nbsp; started ${esc(g.started_at || "")}</div>
+      ${teamBits ? `<div class="meta">${esc(teamBits)}</div>` : ""}
+      ${g.match_end ? `<div class="meta">match end: ${esc(g.match_end)}</div>` : ""}
+      ${g.match_error ? `<div class="err">${esc(g.match_error)}</div>` : ""}
       ${g.error ? `<div class="err">${esc(g.error)}</div>` : ""}
     </div>`;
   }).join("");
@@ -170,8 +180,18 @@ async function refreshStatus() {
   } catch (e) { /* ignore transient errors */ }
 }
 
+function updateTeamsHint() {
+  const n = parseInt($("teams").value, 10);
+  $("teamsHint").textContent = (!n || n < 1)
+    ? "Enter 1-10 teams"
+    : n + (n === 1 ? " team" : " teams") + " = " + (n * 4) + " members running for the guild";
+}
+
+$("teams").addEventListener("input", updateTeamsHint);
+updateTeamsHint();
+
 $("startBtn").onclick = async () => {
-  const teamSize = parseInt($("teamSize").value, 10);
+  const teams = parseInt($("teams").value, 10);
   const guildIds = $("guildIds").value.split(/\n/).map(s => s.trim()).filter(Boolean);
   const region = $("region").value;
   setMsg("", "");
@@ -180,7 +200,7 @@ $("startBtn").onclick = async () => {
     const r = await fetch("/api/start", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({team_size: teamSize, guild_ids: guildIds, region: region})
+      body: JSON.stringify({teams: teams, guild_ids: guildIds, region: region})
     });
     const d = await r.json();
     if (!r.ok || !d.ok) {
