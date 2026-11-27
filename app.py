@@ -325,6 +325,8 @@ def get_bd_bot():
 # TCP auth twice per account (before and after the guild join); the
 # dedup set keeps only the first, so the log shows TCP-CONNECT and
 # then the bot's own "[GUILD ...] Clan join sent" line after it.
+# The set is cleared at the start of each match round (see _run_guild),
+# so every round logs its own TCP-CONNECT lines per account.
 # bd_bot.py stays byte-identical. The wrapper is installed once.
 # ---------------------------------------------------------------------------
 
@@ -369,16 +371,17 @@ def _install_tcp_auth_observer(bd_bot):
 # Driving the ORIGINAL bot's per-account worker
 # ---------------------------------------------------------------------------
 
-def _run_bd_workers(bd_bot, accounts, region, guild_id, stop_event):
+def _run_bd_workers(bd_bot, accounts, region, guild_id, stop_event,
+                    clan_override, round_no=1, loop=None):
     """Hand every generated account to the ORIGINAL BD bot's own worker
-    and run them all.
+    and run them all (ONE match round).
 
     Per account (i-th of the guild's accounts), exactly like the original
     create path's join phase (bd_bot.py line 30473):
       squad_id = bd_bot.IIIllIlIlllII(uid, preferred_index=i)
       bd_bot.lIIIllIIIlllIIl(uid, password,
                              region_override=region,
-                             clan_override=guild_id,
+                             clan_override=clan_override,
                              squad_id=squad_id)
     The helper returns squad = i // 4 (verified by calling it: indices
     0-3 -> squad 0, 4-7 -> squad 1), so the first 4 accounts run as
@@ -391,6 +394,20 @@ def _run_bd_workers(bd_bot, accounts, region, guild_id, stop_event):
     One worker raising does not stop the others (gather with
     return_exceptions=True), so one team's failure never stops the
     other teams of the same guild.
+
+    clan_override: the guild id (round 1) or None (round 2+). Verified
+    in the ORIGINAL bot (bd_bot.py): the driver guards its guild-join
+    step with `if clan_override:` (line 27945) and only then calls
+    `await lllIIIIll(ad[...], clan_override)` (line 27948); the worker
+    passes clan_override through to the driver only (line 28084) — its
+    login takes (uid, password, region_override) and its follow-up
+    takes (uid, squad_id), neither uses the clan. So passing None
+    skips ONLY the guild join: round 2+ is login -> TCP -> match,
+    with the same accounts, same squads. Nothing else changes.
+    loop: a shared asyncio event loop for the guild (created once per
+    guild run and reused across rounds, so any loop-bound objects the
+    bot holds stay valid from round to round). If None, a fresh loop
+    is created per call via asyncio.run (standalone/test use).
 
     Returns the gather result list: None per worker that finished,
     the exception object per worker that raised (including
@@ -410,7 +427,7 @@ def _run_bd_workers(bd_bot, accounts, region, guild_id, stop_event):
             tasks.append(asyncio.create_task(bd_bot.lIIIllIIIlllIIl(
                 str(acc.get("uid")), str(acc.get("password")),
                 region_override=region,
-                clan_override=str(guild_id),
+                clan_override=clan_override,
                 squad_id=squad_id)))
             await asyncio.sleep(0.25)
         if not tasks:
@@ -433,7 +450,19 @@ def _run_bd_workers(bd_bot, accounts, region, guild_id, stop_event):
                 return [asyncio.CancelledError()] * len(tasks)
         return await gather_fut
 
+    if loop is not None:
+        return loop.run_until_complete(_drive())
     return asyncio.run(_drive())
+
+
+# Pause between matches after a round that ended in error (driver
+# error, or one or more workers raising). 15 s — the same interval as
+# the ORIGINAL bot's own login-retry loop (it retries a failed login
+# every 15 s), so an error round waits exactly one worker-retry beat
+# before the next match. The wait is interruptible: a per-guild stop
+# during the pause ends the loop at once instead of waiting it out.
+# A clean round starts the next match immediately (no pause).
+_MATCH_ERROR_PAUSE_S = 15.0
 
 
 class _GuildFailed(Exception):
@@ -494,8 +523,14 @@ def _run_guild(guild_id, teams, region):
        first, then team 2's 4, and so on.
     2. Hand every created account to the ORIGINAL BD bot's worker
        (login -> FIRST TCP connect -> guild join -> match start -> play),
-       exactly like the original create path's join phase. The bot's
-       own printed output flows into this guild's log.
+       exactly like the original create path's join phase — then LOOP:
+       the SAME accounts play match after match (MATCH 1, MATCH 2,
+       ...) until the guild is stopped. Round 1 joins the guild;
+       round 2+ skips the guild join (the worker is called with
+       clan_override=None and the ORIGINAL bot's driver skips its
+       join step) and goes login -> TCP -> match only. No new
+       accounts are created per round. The bot's own printed output
+       flows into this guild's log.
     Runs one thread per guild, so multiple guilds run in parallel.
     All teams of one guild share this thread (one event loop), so
     stopping the guild stops ALL its teams."""
@@ -562,55 +597,137 @@ def _run_guild(guild_id, teams, region):
                 # On stop, drop queued futures immediately; running attempts
                 # finish in the background and their results are discarded.
                 ex.shutdown(wait=False, cancel_futures=True)
-        # -- Original-bot phase: login + guild join + match join + play.
-        # Skipped if stopped (the final block below marks the guild
-        # stopped) or if _GuildFailed raised (its except path runs
-        # instead of this block). --
+        # -- Original-bot phase: MATCH LOOP. The SAME accounts play
+        # match after match until the guild is stopped. Round 1 is
+        # login -> FIRST TCP connect -> guild join -> match (exactly as
+        # before). Round 2+ is login -> TCP -> match ONLY: the worker is
+        # called with clan_override=None, and the ORIGINAL bot's driver
+        # skips its guild-join step (bd_bot.py line 27945:
+        # `if clan_override:` guards the join) — the accounts are
+        # already in the guild, so there is nothing to re-join.
+        # No new accounts are created per round. Skipped if stopped
+        # (the final block below marks the guild stopped) or if
+        # _GuildFailed raised (its except path runs instead). --
         if not stop_event.is_set() and accounts:
             _set_match_stage(guild_id, "joining")
             # Squads are 0..teams-1 (the bot's helper returns
             # squad = global_index // 4, so team t runs as squad t-1).
             squad_list = ", ".join(str(t) for t in range(teams))
-            _log(f"[{guild_id}] handing {len(accounts)} account(s) in "
-                 f"{teams} team(s) (squads {squad_list}) to the original "
-                 f"BD bot worker (login -> TCP -> guild join -> match)",
-                 guild=guild_id)
+            # ONE event loop for this guild, shared by every round.
+            # The bot may hold loop-bound objects (its shared client);
+            # a fresh asyncio.run loop per round could break round 2+,
+            # so all rounds run on the loop created here. Closed below.
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            round_no = 0
+            matches_played = 0
             try:
-                results = _run_bd_workers(bd_bot, accounts, region,
-                                          guild_id, stop_event)
-            except Exception as exc:  # noqa: BLE001 - driver failure
-                results = []
-                _log(f"[{guild_id}] original-bot driver error: "
-                     f"{type(exc).__name__}: {exc}", guild=guild_id)
-                with _guilds_lock:
-                    g = _guilds[guild_id]
-                    g["match_stage"] = "error"
-                    g["match_end"] = "driver error"
-                    g["match_error"] = f"{type(exc).__name__}: {exc}"[:200]
-            else:
-                # matched = workers that ran to completion without raising.
-                # (The worker returns None whether its login/join/match
-                # succeeded or failed — the real per-account outcome is in
-                # the original bot's own log lines, not in a return value.)
-                finished = sum(1 for r in results
-                               if not isinstance(r, BaseException))
-                first_err = next((r for r in results
-                                  if isinstance(r, BaseException)), None)
-                with _guilds_lock:
-                    g = _guilds[guild_id]
-                    g["matched"] = finished
-                    if stop_event.is_set():
-                        g["match_stage"] = "stopped"
-                        g["match_end"] = "stopped"
-                    elif first_err is not None:
-                        g["match_stage"] = "error"
-                        g["match_end"] = "worker error (see log)"
-                        g["match_error"] = (
-                            f"{type(first_err).__name__}: {first_err}"[:200])
+                while not stop_event.is_set():
+                    round_no += 1
+                    # Round 1 joins the guild; round 2+ skips the join
+                    # (clan_override=None — see _run_bd_workers).
+                    clan = str(guild_id) if round_no == 1 else None
+                    # Fresh per-round TCP-CONNECT lines: the observer
+                    # dedups by account_id, so clear it each round.
+                    with _tcp_connected_lock:
+                        _tcp_connected.clear()
+                    with _guilds_lock:
+                        g = _guilds[guild_id]
+                        g["round"] = round_no
+                    if round_no == 1:
+                        _log(f"[{guild_id}] MATCH 1 starting: "
+                             f"{len(accounts)} account(s) in {teams} "
+                             f"team(s) (squads {squad_list}) — original "
+                             f"BD bot worker (login -> TCP -> guild join "
+                             f"-> match)", guild=guild_id)
                     else:
-                        g["match_stage"] = "done"
-                        g["match_end"] = (f"workers done: {finished}/"
-                                          f"{len(accounts)}")
+                        _log(f"[{guild_id}] MATCH {round_no} starting: "
+                             f"same {len(accounts)} account(s), "
+                             f"{teams} team(s) — original BD bot worker "
+                             f"(login -> TCP -> match, NO guild join — "
+                             f"already in guild)", guild=guild_id)
+                    try:
+                        results = _run_bd_workers(
+                            bd_bot, accounts, region, guild_id,
+                            stop_event, clan_override=clan,
+                            round_no=round_no, loop=loop)
+                    except Exception as exc:  # noqa: BLE001 - driver failure
+                        # A driver failure must not kill the loop and
+                        # must not spin: log it, pause one worker-retry
+                        # beat, then start the next match.
+                        _log(f"[{guild_id}] MATCH {round_no} driver "
+                             f"error: {type(exc).__name__}: {exc}; next "
+                             f"match in {_MATCH_ERROR_PAUSE_S:g}s",
+                             guild=guild_id)
+                        with _guilds_lock:
+                            g = _guilds[guild_id]
+                            g["match_error"] = (
+                                f"{type(exc).__name__}: {exc}"[:200])
+                        if stop_event.wait(_MATCH_ERROR_PAUSE_S):
+                            break
+                        continue
+                    if stop_event.is_set():
+                        break
+                    # matched = workers that ran to completion without
+                    # raising. (The worker returns None whether its
+                    # login/join/match succeeded or failed — the real
+                    # per-account outcome is in the original bot's own
+                    # log lines, not in a return value.)
+                    finished = sum(1 for r in results
+                                   if not isinstance(r, BaseException))
+                    first_err = next((r for r in results
+                                      if isinstance(r, BaseException)),
+                                     None)
+                    matches_played += 1
+                    with _guilds_lock:
+                        g = _guilds[guild_id]
+                        g["matched"] = finished
+                        g["matches_played"] = matches_played
+                    if first_err is not None:
+                        # One or more workers raised: log it, pause one
+                        # worker-retry beat, then start the next match.
+                        # The loop never gives up on its own.
+                        _log(f"[{guild_id}] MATCH {round_no} ended with "
+                             f"worker errors ({type(first_err).__name__}: "
+                             f"{first_err}); next match in "
+                             f"{_MATCH_ERROR_PAUSE_S:g}s",
+                             guild=guild_id)
+                        with _guilds_lock:
+                            g = _guilds[guild_id]
+                            g["match_error"] = (
+                                f"{type(first_err).__name__}: "
+                                f"{first_err}"[:200])
+                        if stop_event.wait(_MATCH_ERROR_PAUSE_S):
+                            break
+                        continue
+                    # Clean round: start the next match immediately.
+                    _log(f"[{guild_id}] MATCH {round_no} finished "
+                         f"({finished}/{len(accounts)} workers); "
+                         f"starting MATCH {round_no + 1} with the same "
+                         f"accounts", guild=guild_id)
+            finally:
+                # Shut the shared loop down (cancel anything left, then
+                # close). Errors here must not mask the guild outcome.
+                try:
+                    pending = asyncio.all_tasks(loop)
+                    for t in pending:
+                        t.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(
+                            *pending, return_exceptions=True))
+                except Exception:
+                    pass
+                try:
+                    loop.close()
+                except Exception:
+                    pass
+                asyncio.set_event_loop(None)
+            if stop_event.is_set():
+                with _guilds_lock:
+                    g = _guilds[guild_id]
+                    g["match_stage"] = "stopped"
+                    g["match_end"] = (f"stopped after {matches_played} "
+                                      f"match(es)")
         elif not stop_event.is_set():
             # No accounts created: nothing to hand to the bot.
             _log(f"[{guild_id}] no accounts created, nothing to join",
@@ -734,10 +851,15 @@ def api_start():
                 # match_stage: creating -> joining -> done/stopped/error;
                 # matched counts worker tasks that ran to completion;
                 # match_end / match_error describe the worker outcome.
+                # round: the match round currently running (0 before the
+                # first match); matches_played: rounds completed so far.
+                # The SAME accounts loop round after round until stopped.
                 "match_stage": "creating",
                 "matched": 0,
                 "match_end": "",
                 "match_error": None,
+                "round": 0,
+                "matches_played": 0,
             }
             started.append(gid)
 
@@ -781,6 +903,8 @@ def api_status():
                 "matched": g.get("matched", 0),
                 "match_end": g.get("match_end", ""),
                 "match_error": g.get("match_error"),
+                "round": g.get("round", 0),
+                "matches_played": g.get("matches_played", 0),
             })
     out.sort(key=lambda x: x["started_at"])
     return jsonify({"guilds": out})

@@ -67,6 +67,32 @@ The dashboard is a wrapper. It does not re-implement any bot logic.
    match end. So the flow is: login → FIRST TCP connect → guild join
    → match start → play. The order was NOT changed; it is the
    original's own.
+
+   **Match loop — the SAME accounts play match after match until
+   stopped.** After a match finishes, the next match starts
+   immediately with the same accounts (same uid/password, same
+   teams/squads); no new accounts are created per round. The log
+   shows `MATCH 1 starting`, `MATCH 2 starting`, ... and the card
+   shows the current round and matches played. Round 1 is the full
+   flow above (login → TCP → guild join → match). **Round 2+ skips
+   the guild join entirely** — the accounts are already in the guild.
+   The dashboard calls the same original worker with
+   `clan_override=None`, and the ORIGINAL bot's driver skips its
+   guild-join step by its own code: `if clan_override:` guards the
+   join at bd_bot.py line 27945, and `await lllIIIIll(...)` is at
+   line 27948; the worker passes clan_override through to the
+   driver only (line 28084) — its login takes (uid, password,
+   region) and its follow-up takes (uid, squad_id), neither uses
+   the clan. So round 2+ is login → TCP → match ONLY, using the
+   original's own functions, with nothing rewritten. All rounds of
+   one guild share ONE event loop (created once per guild run), so
+   any loop-bound objects the bot holds stay valid from round to
+   round. A round that ends in error (driver error, or one or more
+   workers raising) is logged and the next match starts after a
+   15 s pause — the same interval as the original bot's own
+   login-retry loop — and the loop never gives up on its own; only
+   stopping the guild ends it. A clean round starts the next match
+   immediately (no pause).
    The first TCP connect is made visible in the log: the TCP auth
    prints nothing on its own, so app.py wraps the bot's TCP-auth
    function (`bd_bot.IIIIIllIIllIl`) with a thin observer that only
@@ -74,7 +100,9 @@ The dashboard is a wrapper. It does not re-implement any bot logic.
    TCP auth returns successfully. The wrapper calls the original
    unchanged and returns its result unchanged; bd_bot.py stays
    byte-identical. The bot's own guild-join print
-   (`[GUILD ...] Clan join sent`) comes after it in the log.
+   (`[GUILD ...] Clan join sent`) comes after it in the log. The
+   observer's per-account set is cleared at the start of each match
+   round, so every round logs its own TCP-CONNECT lines.
    The Vercel wrapper is never called from this path — it only exists
    in the original's separate join helper, which the dashboard does
    not call.
@@ -91,7 +119,9 @@ The dashboard is a wrapper. It does not re-implement any bot logic.
    None whether its login/join/match succeeded or failed, so the real
    per-account outcome is in the original bot's own log lines).
 4. **Stop** — a per-guild stop cancels the running worker tasks
-   (bounded 30 s wait for them to unwind) and marks the guild stopped.
+   (bounded 30 s wait for them to unwind), starts no new match
+   round, and marks the guild stopped (the card shows how many
+   matches were played). Stop-all does the same for every guild.
 
 `jwt.py` is kept in the folder (our login module, MajorLogin on
 loginbp.ppmainecoonghj.com, like the emote bot) but is NOT used by the
@@ -172,13 +202,24 @@ python app.py          # dashboard at http://127.0.0.1:5000
 
 - One gunicorn worker with 8 threads: the in-memory log buffer stays
   consistent, and the SSE stream does not block the dashboard.
-- The dashboard never restarts a finished run automatically.
+- The dashboard never restarts a finished run automatically — but a
+  run does not finish on its own anymore: the SAME accounts loop
+  match after match until the guild is stopped (see the match loop
+  above). Stopping is the only way a run ends.
 - If a guild errors, the others keep running; the error shows on its card.
-- The original bot's worker runs one event loop per guild thread. The
-  bot itself runs a single loop in the original; the dashboard's
-  one-loop-per-guild is the only structural difference, and it is
-  unproven live — the first live run will show whether the bot's
-  shared httpx client is happy across guild loops.
+- The original bot's worker runs one event loop per guild thread,
+  shared by every match round of that guild. The bot itself runs a
+  single loop in the original; the dashboard's one-loop-per-guild is
+  the only structural difference, and it is unproven live — the first
+  live run will show whether the bot's shared httpx client is happy
+  across guild loops, and whether round 2+ login works on the shared
+  loop. If round 2 fails with a loop-bound client error, that is the
+  first thing to check.
+- Round 2+ login + match with the worker stubbed is proven by the
+  loop test (36 checks), but the REAL worker's round-2 login has not
+  run live yet — the stubbed test cannot prove it, because the worker
+  is stubbed. The first live run must confirm round 2 actually
+  starts a match (not just that the loop calls the worker).
 - The worker's internals (login URLs, guild-join host, match join,
   movement) are the original's own and are not re-verified here — the
   dashboard runs them, it does not claim them.
