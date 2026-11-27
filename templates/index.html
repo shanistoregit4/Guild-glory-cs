@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ARIYANA9X — Account Generator</title>
+<title>SHANI VIP — Account Generator</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   :root {
@@ -48,6 +48,8 @@
   .bar > div { height: 100%; background: var(--green); width: 0%; transition: width .4s; }
   .guild .meta { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .guild .err { font-size: 12px; color: var(--red); margin-top: 6px; word-break: break-word; }
+  .rmv { background: none; border: 1px solid var(--border); color: var(--muted); padding: 2px 9px; font-size: 12px; border-radius: 6px; cursor: pointer; flex: none; }
+  .rmv:hover { color: var(--red); border-color: var(--red); }
   .empty { color: var(--muted); font-size: 13px; }
   #logPanel {
     background: #010409; border: 1px solid var(--border); border-radius: 8px;
@@ -63,8 +65,8 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>ARIYANA9X — Account Generator</h1>
-  <p class="sub">Create Free Fire accounts and join them to guilds. Live progress + logs, no terminal needed.</p>
+  <h1>SHANI VIP — Account Generator</h1>
+  <p class="sub">Create Free Fire accounts with our own generator and join them to guilds. Live progress + logs, no terminal needed.</p>
 
   <div class="card">
     <h2>Start a run</h2>
@@ -145,10 +147,13 @@ function renderGuilds(guilds) {
   }
   guildList.innerHTML = guilds.map(g => {
     const pct = g.total ? Math.round(g.created / g.total * 100) : 0;
-    return `<div class="guild">
+    return `<div class="guild" data-gid="${esc(g.guild_id)}">
       <div class="top">
         <span class="gid">${esc(g.guild_id)}</span>
-        <span class="badge ${esc(g.state)}">${esc(g.state.toUpperCase())}</span>
+        <span style="display:flex;gap:8px;align-items:center;">
+          <span class="badge ${esc(g.state)}">${esc(g.state.toUpperCase())}</span>
+          <button class="rmv" data-gid="${esc(g.guild_id)}" title="Stop and remove this guild">✕ Remove</button>
+        </span>
       </div>
       <div class="bar"><div style="width:${pct}%"></div></div>
       <div class="meta">${g.created} / ${g.total} created (${pct}%) &nbsp;·&nbsp; started ${esc(g.started_at || "")}</div>
@@ -192,6 +197,28 @@ $("startBtn").onclick = async () => {
   $("startBtn").disabled = false;
   refreshStatus();
 };
+
+async function removeGuild(gid) {
+  try {
+    const r = await fetch("/api/guilds/" + encodeURIComponent(gid) + "/stop", {method: "POST"});
+    const d = await r.json();
+    if (!r.ok || !d.ok) {
+      setMsg("Error: " + (d.error || r.statusText), "err");
+      return;
+    }
+    setMsg("Removed guild " + gid + " (" + d.state + ")", "ok");
+  } catch (e) {
+    setMsg("Error: " + e.message, "err");
+  }
+  refreshStatus();
+}
+
+// Remove buttons live inside re-rendered guild cards — delegate the click.
+guildList.addEventListener("click", ev => {
+  const btn = ev.target.closest(".rmv");
+  if (!btn) return;
+  removeGuild(btn.dataset.gid);
+});
 
 $("stopBtn").onclick = async () => {
   try {
