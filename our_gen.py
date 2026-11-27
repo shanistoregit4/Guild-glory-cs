@@ -621,7 +621,14 @@ def force_region_bind(region, jwt_token):
                if is_me_th
                else "https://loginbp.mainecoonnodex.com/ChooseRegion")
         host = "loginbp.common.ggbluefox.com" if is_me_th else "loginbp.mainecoonnodex.com"
-        region_code = "RU" if region.upper() == "CIS" else region.upper()
+        # Field 1 is the region the account is bound to. BD accounts are
+        # bound as PK (user is in PK; in the BD bot PK is treated as BD).
+        if region.upper() == "CIS":
+            region_code = "RU"
+        elif region.upper() == "BD":
+            region_code = "PK"
+        else:
+            region_code = region.upper()
         encrypted = encrypt_api(build_proto({1: region_code}).hex())
         dev = get_thread_device()
         headers = _merge_headers({
