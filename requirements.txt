@@ -4,3 +4,7 @@ protobuf==5.29.3
 requests==2.32.3
 urllib3==2.2.3
 gunicorn==23.0.0
+httpx
+aiohttp
+google-play-scraper
+protobuf-decoder
