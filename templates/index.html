@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ARIYANA9X — Account Generator</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2330; --border: #30363d;
+    --text: #e6edf3; --muted: #8b949e; --accent: #2f81f7; --accent2: #1f6feb;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --mono: ui-monospace, "Cascadia Code", Consolas, monospace;
+  }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", Roboto, sans-serif; padding: 16px; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin-bottom: 12px; }
+  label { display: block; font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  input[type=number], textarea, select {
+    width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 9px 10px; font-size: 14px;
+  }
+  textarea { min-height: 74px; font-family: var(--mono); resize: vertical; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1; min-width: 140px; }
+  .btns { display: flex; gap: 10px; margin-top: 16px; }
+  button {
+    flex: 1; padding: 11px; font-size: 15px; font-weight: 600; border: none;
+    border-radius: 8px; cursor: pointer; color: #fff;
+  }
+  #startBtn { background: var(--accent2); }
+  #startBtn:disabled { background: #444; cursor: not-allowed; }
+  #stopBtn { background: #8b2a2a; }
+  #msg { margin-top: 10px; font-size: 13px; min-height: 18px; }
+  #msg.err { color: var(--red); }
+  #msg.ok { color: var(--green); }
+  .guild { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 10px; background: var(--panel2); }
+  .guild .top { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .guild .gid { font-family: var(--mono); font-size: 15px; font-weight: 700; }
+  .badge { font-size: 12px; padding: 3px 9px; border-radius: 20px; font-weight: 600; }
+  .badge.running { background: #1f6feb33; color: #79b8ff; }
+  .badge.done { background: #3fb95033; color: var(--green); }
+  .badge.error { background: #f8514933; color: var(--red); }
+  .badge.stopped { background: #8b949e33; color: var(--muted); }
+  .bar { height: 10px; background: #0d1117; border-radius: 6px; margin-top: 10px; overflow: hidden; }
+  .bar > div { height: 100%; background: var(--green); width: 0%; transition: width .4s; }
+  .guild .meta { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .guild .err { font-size: 12px; color: var(--red); margin-top: 6px; word-break: break-word; }
+  .empty { color: var(--muted); font-size: 13px; }
+  #logPanel {
+    background: #010409; border: 1px solid var(--border); border-radius: 8px;
+    height: 380px; overflow-y: auto; padding: 10px; font-family: var(--mono);
+    font-size: 12px; line-height: 1.55; white-space: pre-wrap; word-break: break-word;
+  }
+  #logPanel .lt { color: #6e7681; }
+  #logPanel .lg { color: #79b8ff; font-weight: 700; }
+  .log-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .log-head span { font-size: 12px; color: var(--muted); }
+  #clearLog { background: none; border: 1px solid var(--border); color: var(--muted); padding: 3px 10px; font-size: 12px; border-radius: 6px; cursor: pointer; flex: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ARIYANA9X — Account Generator</h1>
+  <p class="sub">Create Free Fire accounts and join them to guilds. Live progress + logs, no terminal needed.</p>
+
+  <div class="card">
+    <h2>Start a run</h2>
+    <div class="row">
+      <div>
+        <label for="teamSize">Team size (accounts per guild)</label>
+        <input type="number" id="teamSize" value="4" min="1" max="100">
+      </div>
+      <div>
+        <label for="region">Region</label>
+        <select id="region">
+          <option value="BD" selected>BD</option>
+          <option value="IND">IND</option>
+        </select>
+      </div>
+    </div>
+    <label for="guildIds">Guild IDs (one per line — multiple guilds run in parallel)</label>
+    <textarea id="guildIds" placeholder="12345678&#10;87654321"></textarea>
+    <div class="btns">
+      <button id="startBtn">Start</button>
+      <button id="stopBtn">Stop all</button>
+    </div>
+    <div id="msg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Guilds</h2>
+    <div id="guildList"><p class="empty">No runs yet. Enter guild IDs above and press Start.</p></div>
+  </div>
+
+  <div class="card">
+    <div class="log-head">
+      <h2 style="margin:0">Live log (last 100 lines)</h2>
+      <span id="logCount">0 lines</span>
+      <button id="clearLog">Clear view</button>
+    </div>
+    <div id="logPanel"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const logPanel = $("logPanel");
+const guildList = $("guildList");
+const msg = $("msg");
+let logLines = [];
+
+function setMsg(text, cls) {
+  msg.textContent = text;
+  msg.className = cls || "";
+}
+
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function renderLog() {
+  const atBottom = logPanel.scrollHeight - logPanel.scrollTop - logPanel.clientHeight < 40;
+  logPanel.innerHTML = logLines.map(e =>
+    `<div><span class="lt">[${esc(e.ts.slice(11, 19))}]</span> ` +
+    (e.guild ? `<span class="lg">[${esc(e.guild)}]</span> ` : "") +
+    `${esc(e.line)}</div>`
+  ).join("");
+  $("logCount").textContent = logLines.length + " lines";
+  if (atBottom) logPanel.scrollTop = logPanel.scrollHeight;
+}
+
+function addLine(entry) {
+  logLines.push(entry);
+  if (logLines.length > 100) logLines = logLines.slice(-100);
+  renderLog();
+}
+
+function renderGuilds(guilds) {
+  if (!guilds.length) {
+    guildList.innerHTML = '<p class="empty">No runs yet. Enter guild IDs above and press Start.</p>';
+    return;
+  }
+  guildList.innerHTML = guilds.map(g => {
+    const pct = g.total ? Math.round(g.created / g.total * 100) : 0;
+    return `<div class="guild">
+      <div class="top">
+        <span class="gid">${esc(g.guild_id)}</span>
+        <span class="badge ${esc(g.state)}">${esc(g.state.toUpperCase())}</span>
+      </div>
+      <div class="bar"><div style="width:${pct}%"></div></div>
+      <div class="meta">${g.created} / ${g.total} created (${pct}%) &nbsp;·&nbsp; started ${esc(g.started_at || "")}</div>
+      ${g.error ? `<div class="err">${esc(g.error)}</div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+async function refreshStatus() {
+  try {
+    const r = await fetch("/api/status");
+    const d = await r.json();
+    renderGuilds(d.guilds || []);
+  } catch (e) { /* ignore transient errors */ }
+}
+
+$("startBtn").onclick = async () => {
+  const teamSize = parseInt($("teamSize").value, 10);
+  const guildIds = $("guildIds").value.split(/\n/).map(s => s.trim()).filter(Boolean);
+  const region = $("region").value;
+  setMsg("", "");
+  $("startBtn").disabled = true;
+  try {
+    const r = await fetch("/api/start", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({team_size: teamSize, guild_ids: guildIds, region: region})
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) {
+      setMsg("Error: " + (d.error || r.statusText), "err");
+    } else {
+      let text = "Started: " + (d.started.join(", ") || "none");
+      if (d.skipped_already_running && d.skipped_already_running.length)
+        text += " · already running (skipped): " + d.skipped_already_running.join(", ");
+      setMsg(text, "ok");
+    }
+  } catch (e) {
+    setMsg("Error: " + e.message, "err");
+  }
+  $("startBtn").disabled = false;
+  refreshStatus();
+};
+
+$("stopBtn").onclick = async () => {
+  try {
+    const r = await fetch("/api/stop", {method: "POST"});
+    const d = await r.json();
+    setMsg("Stop requested for: " + (d.stopped.join(", ") || "none running"), "ok");
+  } catch (e) {
+    setMsg("Error: " + e.message, "err");
+  }
+  refreshStatus();
+};
+
+$("clearLog").onclick = () => { logLines = []; renderLog(); };
+
+// Live log via SSE (falls back to polling if SSE fails).
+function connectSSE() {
+  const es = new EventSource("/api/logs/stream");
+  es.onmessage = ev => {
+    try { addLine(JSON.parse(ev.data)); } catch (e) {}
+  };
+  es.onerror = () => {
+    es.close();
+    setTimeout(connectSSE, 3000); // reconnect
+  };
+}
+
+fetch("/api/logs").then(r => r.json()).then(d => {
+  logLines = (d.lines || []).slice(-100);
+  renderLog();
+}).catch(() => {});
+connectSSE();
+refreshStatus();
+setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>
