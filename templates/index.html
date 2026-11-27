@@ -163,7 +163,7 @@ function renderGuilds(guilds) {
         </span>
       </div>
       <div class="bar"><div style="width:${pct}%"></div></div>
-      <div class="meta">Teams: ${teams} &nbsp;·&nbsp; Members: ${members} &nbsp;·&nbsp; Created: ${g.created} / ${g.total} (${pct}%) &nbsp;·&nbsp; match: ${esc(g.match_stage || "—")}${g.matched ? " (" + g.matched + " joined)" : ""} &nbsp;·&nbsp; started ${esc(g.started_at || "")}</div>
+      <div class="meta">Teams: ${teams} &nbsp;·&nbsp; Members: ${members} &nbsp;·&nbsp; Created: ${g.created} / ${g.total} (${pct}%) &nbsp;·&nbsp; match: ${esc(g.match_stage || "—")}${g.matched ? " (" + g.matched + " joined)" : ""} &nbsp;·&nbsp; round: ${g.round || 0} &nbsp;·&nbsp; played: ${g.matches_played || 0} &nbsp;·&nbsp; started ${esc(g.started_at || "")}</div>
       ${teamBits ? `<div class="meta">${esc(teamBits)}</div>` : ""}
       ${g.match_end ? `<div class="meta">match end: ${esc(g.match_end)}</div>` : ""}
       ${g.match_error ? `<div class="err">${esc(g.match_error)}</div>` : ""}
