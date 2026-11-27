@@ -9,15 +9,24 @@ SHANI VIP account generator — Railway web dashboard.
 - GET /api/logs returns the last 100 log lines; GET /api/logs/stream is a
   Server-Sent Events stream that pushes new lines live.
 - POST /api/stop cancels all running guild tasks.
+- POST /api/guilds/<guild_id>/stop stops/removes ONE guild only; other
+  guilds keep running.
 
 The generator is OUR code (our_gen.py, from fast_gen.py): Garena token
 grant + MajorLogin + GetLoginData directly, no author server, no Vercel
-reporting. Guild join uses our RequestJoinClan logic (jwt.py AES key/IV)
-against clientbp directly. Importing our_gen/jwt does NOT start anything
-(both are __main__-guarded); our_gen only defines its Flask app object.
+reporting. After an account is generated, it is logged in FRESH via
+jwt.py (token grant with the guest uid -> MajorLogin -> parse) to get the
+real in-game account_id, a fresh JWT, and the account's own clientbp URL;
+guild join uses our RequestJoinClan logic (jwt.py AES key/IV) against that
+clientbp URL. The guest uid is only ever a login credential — it is never
+displayed or tracked; log lines and the status API use the account_id.
+Importing our_gen/jwt does NOT start anything (both are __main__-guarded);
+our_gen only defines its Flask app object.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import queue
@@ -26,6 +35,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -46,9 +56,15 @@ GEN_WORKERS = 70
 # Stop a guild after this many consecutive generation failures.
 MAX_CONSEC_FAILURES = 10
 
-# Guild join: RequestJoinClan against clientbp directly (same logic as
-# guild_join_from_file.py; HTTP 400 = already in guild, harmless).
-REQUEST_JOIN_CLAN_URL = "https://clientbp.ppmainecoonghj.com/RequestJoinClan"
+# Guild join (RequestJoinClan) — proven logic from guild_join_from_file.py.
+# The generation-time jwt_token is NOT reused: after an account is created
+# we do a FRESH login (token grant with the guest uid -> MajorLogin via
+# jwt.py -> parse_major_login_response), which yields the real in-game
+# account_id, a fresh JWT, and the account's own clientbp URL. The join
+# POSTs to that clientbp URL with Bearer JWT. HTTP 400 = already in
+# guild (harmless). The hardcoded clientbp URL is only a fallback when
+# MajorLogin returns no URL.
+CLIENTBP_FALLBACK_URL = "https://clientbp.ppmainecoonghj.com"
 
 LOG_MAX = 100
 MAX_TEAM_SIZE = 100
@@ -216,19 +232,102 @@ def _pad(data):
     return data + bytes([pad_len]) * pad_len
 
 
-def guild_join(jwtmod, jwt_token, guild_id):
-    """Send RequestJoinClan for one generated account.
+def login_account(jwtmod, uid, password, name=""):
+    """Log one account in (guest uid -> token grant -> MajorLogin).
 
+    Proven flow copied from guild_join_from_file.py: token grant with the
+    GUEST uid (not the in-game account_id), then build_major_login_payload
+    + major_login, then parse_major_login_response, which returns a
+    _MajorLoginResAdapter OBJECT (.token = JWT, .account_id, .url).
+    Returns (info, error): info is the dict (account_id, jwt,
+    clientbp_url, ...) or None; error names the failed step ("" on success).
+    The guest uid/password live only inside the returned info dict — they
+    are never logged or returned by the API.
+    """
+    try:
+        dev_id = f"02-{uuid.uuid4()}"
+        grant_body = {
+            "client_id": jwtmod.APP_ID,
+            "client_secret": jwtmod.CLIENT_SECRET,
+            "client_type": 2,
+            "device_id": dev_id,
+            "password": str(password),
+            "response_type": "token",
+            "uid": int(uid),
+        }
+        try:
+            r = requests.post(jwtmod.URL_TOKEN_GRANT,
+                              headers=jwtmod.HEADERS_MSDK,
+                              json=grant_body, verify=False, timeout=15)
+        except Exception:
+            time.sleep(3)
+            try:
+                r = requests.post(jwtmod.URL_TOKEN_GRANT,
+                                  headers=jwtmod.HEADERS_MSDK,
+                                  json=grant_body, verify=False, timeout=15)
+            except Exception as e2:
+                return None, f"token-grant network error: {e2}"
+        if r.status_code != 200:
+            return None, f"token-grant HTTP {r.status_code}"
+        try:
+            gd = r.json().get("data", {})
+        except Exception:
+            return None, "token-grant bad JSON"
+        access_token = gd.get("access_token")
+        open_id = gd.get("open_id")
+        if not access_token or not open_id:
+            return None, "token-grant missing tokens"
+        try:
+            enc_login = jwtmod.build_major_login_payload(
+                access_token, open_id, f"Google|{uuid.uuid4()}")
+        except Exception as e:
+            return None, f"build MajorLogin payload: {e}"
+        try:
+            login_bytes = jwtmod.major_login(enc_login, access_token)
+        except Exception as e:
+            return None, f"MajorLogin request: {e}"
+        if not login_bytes:
+            return None, "MajorLogin empty reply"
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                proto = jwtmod.parse_major_login_response(login_bytes)
+        except Exception as e:
+            return None, f"parse MajorLogin: {e}"
+        # parse_major_login_response returns a _MajorLoginResAdapter
+        # OBJECT (not a dict): .token = JWT, .account_id, .url,
+        # .aes_ak = TCP key, .iv_i = TCP IV.
+        if not proto or not getattr(proto, "token", None):
+            return None, "MajorLogin no JWT"
+        info = {
+            "uid": str(uid),
+            "password": str(password),
+            "name": name,
+            "account_id": getattr(proto, "account_id", None),
+            "jwt": proto.token,
+            "tcp_key": getattr(proto, "aes_ak", None),
+            "tcp_iv": getattr(proto, "iv_i", None),
+            "clientbp_url": getattr(proto, "url", None)
+                            or CLIENTBP_FALLBACK_URL,
+        }
+        return info, ""
+    except Exception as e:
+        return None, f"unexpected: {e}"
+
+
+def guild_join(jwtmod, info, guild_id):
+    """Send RequestJoinClan for one freshly logged-in account.
+
+    info: the dict from login_account() above (has jwt, clientbp_url).
     Returns (ok, status): ok True on HTTP 200; status is the HTTP code or
     an error string. HTTP 400 = already in that guild (harmless).
     """
-    if not jwt_token:
-        return False, "no jwt_token"
+    if not info or not info.get("jwt"):
+        return False, "no jwt"
     proto = b"\x08" + _varint(int(guild_id)) + b"\x12\x02PK"
     body = AES.new(jwtmod.AES_KEY, AES.MODE_CBC, jwtmod.AES_IV).encrypt(
         _pad(proto))
     headers = {
-        "Authorization": "Bearer " + jwt_token,
+        "Authorization": "Bearer " + info["jwt"],
         "Content-Type": "application/x-www-form-urlencoded",
         "ReleaseVersion": "OB55",
         "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
@@ -237,8 +336,8 @@ def guild_join(jwtmod, jwt_token, guild_id):
         "X-Unity-Version": "2018.4.12f1",
     }
     try:
-        r = requests.post(REQUEST_JOIN_CLAN_URL, data=body,
-                          headers=headers, timeout=20)
+        r = requests.post(info["clientbp_url"] + "/RequestJoinClan",
+                          data=body, headers=headers, timeout=20)
         return (r.status_code == 200), r.status_code
     except Exception as e:  # noqa: BLE001 - report as a join failure
         return False, str(e)
@@ -330,22 +429,35 @@ def _run_guild(guild_id, team_size, region):
                         continue
                     consecutive_failures = 0
                     created += 1
-                    uid = acc.get("uid")
-                    _log(f"[CREATED] Bot {created}/{team_size} | UID: {uid}",
-                         guild=guild_id)
+                    # Fresh login (proven flow): yields the real in-game
+                    # account_id, a fresh JWT and the account's own
+                    # clientbp URL. The guest uid is only the login
+                    # credential passed to login_account — it is never
+                    # displayed, logged, or tracked anywhere.
+                    gen_account_id = acc.get("account_id", "?")
+                    info, login_err = login_account(
+                        jwtmod, acc.get("uid"), acc.get("password"))
+                    if not info:
+                        _log(f"[CREATED] Bot {created}/{team_size} | "
+                             f"ID: {gen_account_id}", guild=guild_id)
+                        _log(f"[LOGIN-FAIL] ID {gen_account_id} -> guild "
+                             f"{guild_id}: {login_err}", guild=guild_id)
+                        continue
+                    account_id = info.get("account_id") or gen_account_id
+                    _log(f"[CREATED] Bot {created}/{team_size} | "
+                         f"ID: {account_id}", guild=guild_id)
                     # Join this account to the guild. A join failure does
                     # NOT stop generation of the remaining accounts.
-                    ok, status = guild_join(jwtmod, acc.get("jwt_token"),
-                                            guild_id)
+                    ok, status = guild_join(jwtmod, info, guild_id)
                     if ok:
-                        _log(f"[JOINED] UID {uid} -> guild {guild_id}",
+                        _log(f"[JOINED] ID {account_id} -> guild {guild_id}",
                              guild=guild_id)
                     elif status == 400:
-                        _log(f"[JOINED] UID {uid} -> guild {guild_id} "
+                        _log(f"[JOINED] ID {account_id} -> guild {guild_id} "
                              f"(already in guild)", guild=guild_id)
                     else:
-                        _log(f"[JOIN-FAIL] UID {uid} -> guild {guild_id}: "
-                             f"{status}", guild=guild_id)
+                        _log(f"[JOIN-FAIL] ID {account_id} -> guild "
+                             f"{guild_id}: {status}", guild=guild_id)
             finally:
                 # On stop, drop queued futures immediately; running attempts
                 # finish in the background and their results are discarded.
@@ -467,6 +579,8 @@ def api_status():
     with _guilds_lock:
         out = []
         for gid, g in _guilds.items():
+            if g.get("hidden"):
+                continue
             out.append({
                 "guild_id": gid,
                 "state": g["state"],
@@ -530,6 +644,39 @@ def api_stop():
             ev.set()
             stopped.append(g["guild_id"])
     return jsonify({"ok": True, "stopped": stopped})
+
+
+@app.route("/api/guilds/<guild_id>/stop", methods=["POST"])
+def api_guild_stop(guild_id):
+    """Stop/remove ONE guild only; other running guilds are untouched.
+
+    A running guild gets its stop_event set and is marked stopped (its
+    thread notices within one wave and exits). In all cases the entry is
+    hidden from the dashboard, so the card disappears and status polls
+    never bring it back. The entry is kept internally (not deleted) so
+    the running thread can still update it safely. 404 if unknown.
+    """
+    with _guilds_lock:
+        g = _guilds.get(guild_id)
+        if g is None:
+            return jsonify({"ok": False, "error": "unknown guild ID"}), 404
+        state = g["state"]
+        log_stop = False
+        if state == "running":
+            ev = g.get("stop_event")
+            if ev is not None:
+                ev.set()
+            g["state"] = "stopped"
+            g["ended_at"] = _now_iso()
+            state = "stopped"
+            log_stop = True
+            created, total = g["created"], g["total"]
+        g["hidden"] = True
+    if log_stop:
+        _log(f"[{guild_id}] stopped by user ({created}/{total} created)",
+             guild=guild_id)
+    return jsonify({"ok": True, "guild_id": guild_id, "state": state,
+                    "removed": True})
 
 
 if __name__ == "__main__":

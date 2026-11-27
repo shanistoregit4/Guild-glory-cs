@@ -16,6 +16,8 @@ from the dashboard.
 - **Per-guild progress** — created/total with a progress bar, state
   (running / done / error / stopped).
 - **Stop all** — cancels every running guild task.
+- **Remove (✕) on each guild card** — stops and removes just that one guild;
+  other guilds keep running. Also removes finished guilds from the view.
 
 ## Our generator (not the BD bot)
 
@@ -28,13 +30,22 @@ author's backend. This version replaces it with **our own generator**:
   directly. No author server, nothing reported to anyone.
 - `jwt.py` — our login module (MajorLogin / GetLoginData / AES), unchanged.
 - Guild join is our own `RequestJoinClan` (AES-CBC protobuf
-  `{f1=guild_id, f2="PK"}`, Bearer JWT) against clientbp directly.
-  HTTP 400 = already in that guild, treated as joined.
+  `{f1=guild_id, f2="PK"}`, Bearer JWT). After an account is generated, the
+  dashboard does a **fresh login** for it (token grant with the guest uid
+  → MajorLogin via jwt.py → parse), which yields the real in-game
+  `account_id`, a fresh JWT, and the account's **own clientbp URL**; the
+  join POSTs to that URL. The generation-time token is never reused and
+  the clientbp URL is never hardcoded (a fixed URL is only a fallback if
+  MajorLogin returns none). HTTP 400 = already in that guild, treated as
+  joined. A failed fresh login is logged as `[LOGIN-FAIL]` and the join is
+  skipped for that account, but the account still counts as created.
 - Each guild runs with **70 workers**. A failed attempt is retried; a guild
   stops with an error after 10 consecutive failures. A join failure never
   stops generation of the remaining accounts.
-- Accounts are only shown in the log (`[CREATED] Bot n/total | UID: ...`,
-  `[JOINED] UID ... -> guild ...`). Nothing is saved to disk.
+- Accounts are only shown in the log (`[CREATED] Bot n/total | ID: ...`,
+  `[JOINED] ID ... -> guild ...`) using the **in-game account_id**. The
+  guest uid is only a login credential and is never displayed, logged, or
+  returned by the API. Nothing is saved to disk.
 
 ## Deploy on Railway
 
@@ -60,7 +71,8 @@ rebuilds from the Dockerfile, so the deleted files do not linger.)
 2. Paste **Guild IDs**, one per line.
 3. Pick **Region** (BD / IND).
 4. Press **Start**. Each guild gets its own progress card; the log streams live.
-5. Press **Stop all** to cancel running guilds.
+5. Press **Stop all** to cancel running guilds, or **✕ Remove** on one card
+   to stop and remove just that guild.
 
 ## Run locally (optional)
 
