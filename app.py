@@ -24,30 +24,31 @@ THE FLOW — the ORIGINAL BD bot, with only account creation replaced:
   (uid, password, region_override, clan_override, squad_id) does its
   combined login (its own version check + token grant + MajorLogin +
   GetLoginData), then its post-login driver — UDP setup
-  (bd_bot.py line 27810), lobby TCP auth FIRST (line 27834), then
-  its follow-up call, and plays/idles to the match end. So the flow
-  is: login -> FIRST TCP connect -> guild join -> match start -> play.
-  The dashboard does NOT re-implement any of that: no rewritten
-  login, no rewritten match/team/UDP code, no guessed values.
+  (bd_bot.py line 27810), Homer/roles setup (line 27841), lobby TCP
+  auth FIRST (line 27834), then its follow-up call, and plays/idles
+  to the match end. So the flow is: login -> ChooseNewbie -> Homer
+  skill equip -> guild join -> FIRST TCP connect -> match start
+  -> play. The dashboard does NOT re-implement any of that: no
+  rewritten login, no rewritten match/team/UDP code, no guessed
+  values.
 - The guild join is the bot's OWN function `lllIIIIll`, but it is
   fired by the dashboard wrapper, not by the driver's own step:
   the driver's guild-join step (bd_bot.py line 27948) is never
   reached in practice, because the driver's second TCP auth
   (chat, line 27972) hangs and never returns, so the driver never
-  gets to line 27948. The dashboard's TCP-auth observer (see below)
-  fires `lllIIIIll` itself, right after the FIRST TCP connect
-  returns successfully — the guild join only needs TCP to be
-  connected, and the first connect proves that. Round 1 only;
+  gets to line 27948. The dashboard's Homer observer (see below)
+  fires `lllIIIIll` itself, right after the Homer skill is equipped
+  — per account the order is ChooseNewbie, then Homer skill equip,
+  then the guild join, then the first TCP connect. Round 1 only;
   round 2+ never fires it (the accounts are already in the guild).
   bd_bot.py stays byte-identical.
 - The first lobby TCP auth is made VISIBLE (it prints nothing on its
   own): app.py wraps the bot's TCP-auth function
   (bd_bot.IIIIIllIIllIl) with a thin observer that logs
   "[TCP-CONNECT] ID <account_id>" the first time an account's TCP
-  auth returns successfully, and (round 1 only) fires the guild
-  join right after it. The wrapper calls the original unchanged,
-  returns its result unchanged, and re-raises its exceptions
-  unchanged; bd_bot.py stays byte-identical.
+  auth returns successfully. The wrapper calls the original
+  unchanged, returns its result unchanged, and re-raises its
+  exceptions unchanged; bd_bot.py stays byte-identical.
 - Teams: a CS squad is 4 players, so the form asks for the NUMBER OF
   TEAMS (1-10, default 1); total members = teams x 4. The bot's own
   squad helper (bd_bot.IIIllIlIlllII, called with preferred_index =
@@ -86,9 +87,12 @@ from datetime import datetime, timezone
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
+import httpx  # for the dashboard's own guild-join POST (user's exact request)
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 GEN_PATH = os.path.join(APP_DIR, "our_gen.py")
 BD_BOT_PATH = os.path.join(APP_DIR, "bd_bot.py")
+JWT_PATH = os.path.join(APP_DIR, "jwt.py")
 
 # Our generator's fixed name/password prefixes (fast_gen defaults).
 NAME_PREFIX = "shani"
@@ -299,6 +303,7 @@ def get_bd_bot():
             _bd_bot = mod
             _log("[dashboard] original BD bot imported OK")
             _install_tcp_auth_observer(_bd_bot)
+            _install_homer_observer(_bd_bot)
             return _bd_bot
         except BaseException as exc:  # noqa: BLE001 - includes SystemExit from the bot's net check
             _bd_bot_error = exc
@@ -308,44 +313,122 @@ def get_bd_bot():
 
 
 # ---------------------------------------------------------------------------
-# First-TCP-connect observer + guild join (Change 1 — makes the order
-# VISIBLE, and fires the guild join right after the first connect).
+# Guild join — the USER's exact proven request (sent 2026-11-27).
 #
-# Verified in the ORIGINAL bot's post-login driver (bd_bot.py):
-#   line 27810  UDP setup call
-#   line 27834  TCP auth #1 (lobby/online TCP auth, 0x83-style)
-#   line 27948  guild join (lllIIIIll) — guarded by `if clan_override:`
-#   line 27972  TCP auth #2 (chat, same function, typ='ChaT')
-# In the bot's own line order the guild join sits between the two TCP
-# auths. But in EXECUTION order the driver awaits TCP auth #2 (line
-# 27972) before it ever reaches the guild-join step (line 27948), and
-# TCP auth #2 hangs and never returns (proven live 2026-11-27: the
-# first TCP auth returned, no RequestJoinClan was ever sent, and the
-# driver never raised). So the driver's own guild-join step is never
-# reached, and the guild join never fires.
+# The bot's own lllIIIIll builds a body with ONLY field 1 (guild id)
+# and returned False live for all 4 accounts. The user's own script
+# builds field 1 (guild id, varint) + field 2 (region "PK") and got
+# HTTP 200 live. So the dashboard sends the user's exact request here,
+# with the bot's own login token (ad['token']) as the Bearer token.
+# The body is AES-128-CBC encrypted with the static HTTP key/IV
+# (jwt.py's enc_aes, same values the user's script uses), PKCS7 pad.
+# Headers are the script's exact headers. No bot file is changed;
+# the bot's lllIIIIll is simply not called anymore.
+# ---------------------------------------------------------------------------
+
+_GUILD_JOIN_URL = "https://clientbp.ppmainecoonghj.com/RequestJoinClan"
+_GUILD_JOIN_REGION = b"PK"
+_GUILD_JOIN_HEADERS = {
+    "Accept": "*/*",
+    "Accept-Encoding": "deflate, gzip",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "ReleaseVersion": "OB55",
+    "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+    "X-GA": "v1 1",
+    "X-GA-SV": "1791979434",
+    "X-Unity-Version": "2018.4.12f1",
+}
+
+_jwt_mod = None
+_jwt_lock = threading.Lock()
+
+def get_jwt_mod():
+    """Load jwt.py for its static AES key/IV, enc_aes and encode_varint."""
+    global _jwt_mod
+    if _jwt_mod is not None:
+        return _jwt_mod
+    with _jwt_lock:
+        if _jwt_mod is not None:
+            return _jwt_mod
+        _jwt_mod = _load_module("jwt_mod", JWT_PATH)
+        return _jwt_mod
+
+def _guild_join_body(guild_id):
+    """Guild-join body, exactly as the user's script: protobuf field 1
+    (0x08 varint) = guild id, field 2 (0x12) = region "PK", then
+    AES-128-CBC encrypt (static key/IV, PKCS7 pad)."""
+    jwt_mod = get_jwt_mod()
+    proto = b"\x08" + jwt_mod.encode_varint(int(guild_id))
+    proto += b"\x12" + bytes([len(_GUILD_JOIN_REGION)]) + _GUILD_JOIN_REGION
+    return jwt_mod.enc_aes(proto)
+
+async def _guild_join_request(token, guild_id, url=None):
+    """Send the user's exact RequestJoinClan POST. True on HTTP 200,
+    False otherwise (never raises; failures are logged)."""
+    try:
+        body = _guild_join_body(guild_id)
+    except Exception as exc:  # noqa: BLE001 - join must never break the bot
+        _log(f"[GUILD-JOIN] body build failed: {type(exc).__name__}: {exc}")
+        return False
+    headers = dict(_GUILD_JOIN_HEADERS)
+    headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url or _GUILD_JOIN_URL,
+                                     content=body, headers=headers)
+        return resp.status_code == 200
+    except Exception as exc:  # noqa: BLE001 - join must never break the bot
+        _log(f"[GUILD-JOIN] request failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Homer-skill observer: fires the guild join right after the skill
+# (Change 1) + first-TCP-connect observer (makes TCP visible).
 #
-# Fix, WITHOUT touching the bot: the dashboard fires the bot's OWN
-# guild-join function itself, right after the FIRST TCP connect
-# returns. The guild join only needs TCP to be connected, and the
-# first connect proves that — so "just after any connect" is the
-# first connect. The observer wraps bd_bot.IIIIIllIIllIl (the module
-# global the driver resolves by bare name at lines 27834/27972) in
-# app.py only. On the FIRST successful TCP auth per account it:
-#   1. logs "[TCP-CONNECT] ID <account_id>", and
-#   2. (round 1 only) awaits the bot's own lllIIIIll(token, guild_id)
-#      with the token from the TCP-auth call and the guild id the
-#      dashboard was started with, then logs the result.
-# The wrapper calls the original TCP auth unchanged, returns its
-# result unchanged, and re-raises its exceptions unchanged. A guild
-# -join failure is logged and never propagates (it must not break the
-# TCP auth the driver is awaiting). Round 2+ never fires the join:
-# _run_bd_workers only registers a target for accounts when
-# clan_override is set (round 1), and clears it otherwise.
-# bd_bot.py stays byte-identical. The wrapper is installed once.
+# Per-account order, proven live 2026-11-27:
+#   ChooseNewbie -> Homer skill equip -> TCP auth #1 -> ...
+# The driver calls the Homer/roles setup `lIIlIIII(ad)` (bd_bot.py
+# line 27841; factory line 27260, inner line 27262) BEFORE the first
+# TCP auth (line 27834). Inside it, homor.init_homor_roles does
+# GiveNewbieRoles then SelectPreset (skill 5506), and back in
+# lIIlIIII it prints '[HOMER] Skill 5506 equipped' and returns ok.
+# lIIlIIII takes the account dict ad; ad['token'] is the bot's own
+# MajorLogin JWT (it is passed to init_homor_roles as the Bearer
+# token, and both role calls succeeded live, so it is valid right
+# there). It creates no asyncio tasks and is called from exactly one
+# place (driver line 27841), so wrapping it cannot disturb the
+# team/match flow.
+#
+# The driver's own guild-join step (line 27948) is never reached in
+# practice: in execution order the driver awaits the chat TCP auth
+# (line 27972) before it reaches line 27948, and the chat auth hangs
+# and never returns. So the dashboard fires the guild join itself,
+# right after `lIIlIIII` returns successfully — i.e. right after the
+# Homer skill is equipped and BEFORE the first TCP connect, exactly
+# where the user put it. It sends the USER's exact RequestJoinClan
+# request (see the guild-join section above: field 1 + field 2 "PK",
+# the script's headers) — the bot's own lllIIIIll is not used, its
+# body has only field 1 and returned False live. The wrapper
+# receives ad, awaits the original, and if it returned truthy (skill
+# actually activated) and this is round 1, awaits
+# _guild_join_request(ad['token'], guild_id) and logs the result.
+# A guild-join failure is logged and never propagates (it must not
+# break the driver). Round 2+ never fires the join: _run_bd_workers
+# only registers a target when clan_override is set (round 1), and
+# clears it otherwise. If lIIlIIII returns False the skill was not
+# activated — do not fire.
+#
+# The TCP-auth observer is separate and only logs: it wraps
+# bd_bot.IIIIIllIIllIl and logs "[TCP-CONNECT] ID <account_id>" the
+# first time an account's TCP auth returns successfully. Both
+# wrappers call the original unchanged, return its result unchanged,
+# and re-raise its exceptions unchanged. bd_bot.py stays
+# byte-identical. Both wrappers are installed once.
 # ---------------------------------------------------------------------------
 
 _tcp_auth_orig = None          # the bot's original IIIIIllIIllIl
-_bd_bot_mod = None             # the bot module (for its lllIIIIll)
+_homer_orig = None             # the bot's original lIIlIIII
 _tcp_connected = set()         # account_ids already logged as TCP-CONNECT
 _tcp_connected_lock = threading.Lock()
 _guild_join_target = {}        # account key -> guild id (round 1 only)
@@ -377,49 +460,61 @@ def _set_guild_join_targets(accounts, clan_override):
 
 async def _tcp_auth_observer(*args, **kwargs):
     """Observe the bot's lobby TCP auth; log the first success per
-    account, and (round 1 only) fire the guild join right after it.
+    account.
 
-    account_id is the first positional arg and token the second
+    account_id is the first positional arg
     (IlllIIIIIIlIIIII(account_id, token, server_time, key, iv, ...)).
     Success = the awaited call returns without raising (the driver
     does not check the return value before the guild join — it just
     awaits and moves on — so a clean return is what the driver
-    itself treats as connected)."""
+    itself treats as connected). The guild join is NOT fired here
+    anymore — it fires right after the Homer skill (see
+    _homer_observer), before the first TCP connect."""
     result = await _tcp_auth_orig(*args, **kwargs)
     account_id = str(args[0]) if args else "?"
     with _tcp_connected_lock:
         first = account_id not in _tcp_connected
         if first:
             _tcp_connected.add(account_id)
-    if not first:
+    if first:
+        _log(f"[TCP-CONNECT] ID {account_id}")
+    return result
+
+
+async def _homer_observer(ad):
+    """Observe the bot's Homer/roles setup; fire the guild join right
+    after the skill is equipped (round 1 only).
+
+    ad is the account dict. The original does GiveNewbieRoles then
+    SelectPreset (skill 5506) and returns True only when the skill
+    was actually equipped. On a truthy return, and only when this
+    account has a round-1 guild-join target, send the USER's exact
+    RequestJoinClan request with ad['token'] — the same token the
+    driver's own guild-join step would pass — and log the result.
+    A join failure is logged and never propagates."""
+    result = await _homer_orig(ad)
+    if not result:
+        return result  # skill not activated; do not fire the join
+    if not isinstance(ad, dict):
         return result
-    _log(f"[TCP-CONNECT] ID {account_id}")
-    # Guild join, right after the first connect (round 1 only).
-    # The target map holds the guild id for this account only when
-    # the round was started with a clan_override (round 1); round 2+
-    # clears it, so no re-join. The token is the TCP-auth call's
-    # second positional arg — the same ad['token'] the driver's own
-    # guild-join step would pass to lllIIIIll.
+    account_id = str(ad.get("account_id") or ad.get("uid") or "?")
     with _guild_join_lock:
         guild_id = _guild_join_target.get(account_id)
+        if guild_id is None and ad.get("uid") is not None:
+            guild_id = _guild_join_target.get(str(ad.get("uid")))
     if guild_id is None:
         return result
-    token = args[1] if len(args) >= 2 else kwargs.get("token")
+    token = ad.get("token")
     if not token:
         _log(f"[GUILD-JOIN] no token for ID {account_id}; guild join "
              f"skipped (guild {guild_id})")
         return result
-    join_fn = getattr(_bd_bot_mod, "lllIIIIll", None) if _bd_bot_mod else None
-    if join_fn is None:
-        _log(f"[GUILD-JOIN] bot has no lllIIIIll; guild join skipped "
-             f"(guild {guild_id})")
-        return result
     try:
-        ok = await join_fn(token, guild_id)
-        _log(f"[GUILD-JOIN] after TCP-CONNECT: ID {account_id} -> "
+        ok = await _guild_join_request(token, guild_id)
+        _log(f"[GUILD-JOIN] after HOMER skill: ID {account_id} -> "
              f"guild {guild_id} (result: {ok})")
     except Exception as exc:  # noqa: BLE001 - a join failure must not
-        # break the TCP auth the driver is awaiting.
+        # break the driver flow the Homer setup belongs to.
         _log(f"[GUILD-JOIN] ID {account_id} -> guild {guild_id} "
              f"failed: {type(exc).__name__}: {exc}")
     return result
@@ -427,15 +522,28 @@ async def _tcp_auth_observer(*args, **kwargs):
 
 def _install_tcp_auth_observer(bd_bot):
     """Install _tcp_auth_observer as bd_bot.IIIIIllIIllIl (once)."""
-    global _tcp_auth_orig, _bd_bot_mod
+    global _tcp_auth_orig
     if _tcp_auth_orig is not None:
         return  # already installed
     orig = getattr(bd_bot, "IIIIIllIIllIl", None)
     if orig is None:
         return  # bot has no such function; nothing to observe
     _tcp_auth_orig = orig
-    _bd_bot_mod = bd_bot
     bd_bot.IIIIIllIIllIl = _tcp_auth_observer
+
+
+def _install_homer_observer(bd_bot):
+    """Install _homer_observer as bd_bot.lIIlIIII (once). The driver
+    calls lIIlIIII by bare name (line 27841), so the wrapper is
+    picked up exactly like the TCP-auth observer."""
+    global _homer_orig
+    if _homer_orig is not None:
+        return  # already installed
+    orig = getattr(bd_bot, "lIIlIIII", None)
+    if orig is None:
+        return  # bot has no such function; nothing to observe
+    _homer_orig = orig
+    bd_bot.lIIlIIII = _homer_observer
 
 
 # ---------------------------------------------------------------------------
@@ -463,11 +571,12 @@ def _run_bd_workers(bd_bot, accounts, region, guild_id, stop_event,
     (UDP setup, lobby TCP auth FIRST, TCP auth again for chat), then its
     follow-up call, and plays/idles to the match end. The guild join is
     NOT left to the driver's own step (it is never reached — the chat
-    TCP auth hangs first); the dashboard's TCP-auth observer fires the
-    bot's own lllIIIIll right after the FIRST TCP connect returns
-    (see _tcp_auth_observer). _set_guild_join_targets below registers
-    the round's guild-join targets (round 1) or clears them (round 2+)
-    before the workers launch.
+    TCP auth hangs first); the dashboard's Homer observer fires the
+    bot's own lllIIIIll right after the Homer skill is equipped,
+    before the first TCP connect (see _homer_observer).
+    _set_guild_join_targets below registers the round's guild-join
+    targets (round 1) or clears them (round 2+) before the workers
+    launch.
     One worker raising does not stop the others (gather with
     return_exceptions=True), so one team's failure never stops the
     other teams of the same guild.
@@ -600,8 +709,9 @@ def _run_guild(guild_id, teams, region):
        gen's own MajorLogin). The 4 accounts of team 1 are created
        first, then team 2's 4, and so on.
     2. Hand every created account to the ORIGINAL BD bot's worker
-       (login -> FIRST TCP connect -> guild join -> match start -> play),
-       exactly like the original create path's join phase — then LOOP:
+       (login -> Homer skill -> guild join -> FIRST TCP connect ->
+       match start -> play), exactly like the original create path's
+       join phase — then LOOP:
        the SAME accounts play match after match (MATCH 1, MATCH 2,
        ...) until the guild is stopped. Round 1 joins the guild;
        round 2+ skips the guild join (the worker is called with
@@ -616,11 +726,15 @@ def _run_guild(guild_id, teams, region):
     with _thread_guild_lock:
         _thread_guild[threading.get_ident()] = guild_id
     stop_event = threading.Event()
+    accounts = []  # our_gen dicts, in creation order
     with _guilds_lock:
         _guilds[guild_id]["stop_event"] = stop_event
+        # Keep the live accounts list on the guild entry so Remove can
+        # drop every account tied to this guild id (see api_guild_stop).
+        # The entry is never exposed by /api/status.
+        _guilds[guild_id]["accounts"] = accounts
     created = 0
     consecutive_failures = 0
-    accounts = []  # our_gen dicts, in creation order
     try:
         our_gen = get_gen()
         bd_bot = get_bd_bot()
@@ -677,8 +791,8 @@ def _run_guild(guild_id, teams, region):
                 ex.shutdown(wait=False, cancel_futures=True)
         # -- Original-bot phase: MATCH LOOP. The SAME accounts play
         # match after match until the guild is stopped. Round 1 is
-        # login -> FIRST TCP connect -> guild join -> match (exactly as
-        # before). Round 2+ is login -> TCP -> match ONLY: the worker is
+        # login -> Homer skill -> guild join -> TCP -> match. Round 2+
+        # is login -> TCP -> match ONLY: the worker is
         # called with clan_override=None, and the ORIGINAL bot's driver
         # skips its guild-join step (bd_bot.py line 27945:
         # `if clan_override:` guards the join) — the accounts are
@@ -716,8 +830,9 @@ def _run_guild(guild_id, teams, region):
                         _log(f"[{guild_id}] MATCH 1 starting: "
                              f"{len(accounts)} account(s) in {teams} "
                              f"team(s) (squads {squad_list}) — original "
-                             f"BD bot worker (login -> TCP -> guild join "
-                             f"-> match)", guild=guild_id)
+                             f"BD bot worker (login -> Homer skill -> "
+                             f"guild join -> TCP -> match)",
+                             guild=guild_id)
                     else:
                         _log(f"[{guild_id}] MATCH {round_no} starting: "
                              f"same {len(accounts)} account(s), "
@@ -844,6 +959,14 @@ def _run_guild(guild_id, teams, region):
     finally:
         with _thread_guild_lock:
             _thread_guild.pop(threading.get_ident(), None)
+        # The run is over: drop every account tied to this guild id so
+        # a stopped/removed guild keeps no accounts around (the Remove
+        # endpoint clears the same list at click time; this covers
+        # Stop-all and natural end too).
+        with _guilds_lock:
+            g = _guilds.get(guild_id)
+            if g is not None and g.get("accounts"):
+                g["accounts"].clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1046,10 +1169,14 @@ def api_guild_stop(guild_id):
 
     A running guild gets its stop_event set and is marked stopped (its
     thread notices within one wave and exits; a running original-bot
-    worker phase is cancelled within ~30s). In all cases the entry is
-    hidden from the dashboard, so the card disappears and status polls
-    never bring it back. The entry is kept internally (not deleted) so
-    the running thread can still update it safely. 404 if unknown.
+    worker phase is cancelled within ~30s). Remove also drops EVERY
+    account tied to this guild id: the guild's accounts list is
+    cleared here (and again when its thread exits), so no account of
+    a removed guild keeps running or is kept around. In all cases the
+    entry is hidden from the dashboard, so the card disappears and
+    status polls never bring it back. The entry is kept internally
+    (not deleted) so the running thread can still update it safely.
+    404 if unknown.
     """
     with _guilds_lock:
         g = _guilds.get(guild_id)
@@ -1057,6 +1184,12 @@ def api_guild_stop(guild_id):
             return jsonify({"ok": False, "error": "unknown guild ID"}), 404
         state = g["state"]
         log_stop = False
+        # Remove every account tied to this guild id.
+        accts = g.get("accounts")
+        removed = 0
+        if accts:
+            removed = len(accts)
+            accts.clear()
         if state == "running":
             ev = g.get("stop_event")
             if ev is not None:
@@ -1070,8 +1203,11 @@ def api_guild_stop(guild_id):
     if log_stop:
         _log(f"[{guild_id}] stopped by user ({created}/{total} created)",
              guild=guild_id)
+    if removed:
+        _log(f"[{guild_id}] removed: {removed} account(s) removed",
+             guild=guild_id)
     return jsonify({"ok": True, "guild_id": guild_id, "state": state,
-                    "removed": True})
+                    "removed": True, "accounts_removed": removed})
 
 
 if __name__ == "__main__":

@@ -22,8 +22,8 @@ prompts, no Skip option — everything runs from the dashboard.
   worker stage (`creating` → `joining` → `done` / `stopped` / `error`).
 - **Stop all** — cancels every running guild task.
 - **Remove (✕) on each guild card** — stops and removes just that one guild
-  (all its teams); other guilds keep running. Also removes finished guilds
-  from the view.
+  (all its teams) AND every account tied to that guild id; other guilds
+  keep running. Also removes finished guilds from the view.
 
 ## The flow — ORIGINAL BD bot, only creation replaced
 
@@ -59,19 +59,21 @@ The dashboard is a wrapper. It does not re-implement any bot logic.
    gap) and gathered, in one event loop per guild thread. The worker
    does its combined login (its own version check against
    version.ggwhitehawk.com, token grant, MajorLogin, GetLoginData),
-   then its post-login driver: UDP setup (line 27810) → **lobby TCP
-   auth FIRST (line 27834)** → TCP auth again for chat (line 27972)
-   — then its follow-up call, and plays/idles to the match end. The
-   guild join sits between the two TCP auths in the bot's own line
-   order (`lllIIIIll` at line 27948, guarded by `if clan_override:`
-   at line 27945), but the driver's own guild-join step is NEVER
-   reached in practice: in execution order the driver awaits the
-   chat TCP auth (line 27972) before it reaches line 27948, and the
-   chat auth hangs and never returns (proven live 2026-11-27). So
-   the dashboard fires the bot's OWN `lllIIIIll` itself, right after
-   the FIRST TCP connect returns — the guild join only needs TCP to
-   be connected, and the first connect proves that. The flow is:
-   login → FIRST TCP connect → guild join → match start → play.
+   then its post-login driver: UDP setup (line 27810) → Homer/roles
+   setup `lIIlIIII(ad)` (line 27841: GiveNewbieRoles, then
+   SelectPreset skill 5506) → **lobby TCP auth FIRST (line 27834)**
+   → TCP auth again for chat (line 27972) — then its follow-up call,
+   and plays/idles to the match end. The guild join sits between the
+   two TCP auths in the bot's own line order (`lllIIIIll` at line
+   27948, guarded by `if clan_override:` at line 27945), but the
+   driver's own guild-join step is NEVER reached in practice: in
+   execution order the driver awaits the chat TCP auth (line 27972)
+   before it reaches line 27948, and the chat auth hangs and never
+   returns (proven live 2026-11-27). So the dashboard fires the
+   bot's OWN `lllIIIIll` itself, right after the Homer skill is
+   equipped — per account the order is ChooseNewbie, Homer skill,
+   guild join, then TCP. The flow is: login → Homer skill equip →
+   guild join → FIRST TCP connect → match start → play.
    bd_bot.py is untouched.
 
    **Match loop — the SAME accounts play match after match until
@@ -80,11 +82,11 @@ The dashboard is a wrapper. It does not re-implement any bot logic.
    teams/squads); no new accounts are created per round. The log
    shows `MATCH 1 starting`, `MATCH 2 starting`, ... and the card
    shows the current round and matches played. Round 1 is the full
-   flow above (login → TCP → guild join → match). **Round 2+ skips
-   the guild join entirely** — the accounts are already in the guild.
-   The dashboard calls the same original worker with
-   `clan_override=None`, and the dashboard's guild-join targets are
-   cleared for that round, so the TCP-auth observer never fires the
+   flow above (login → Homer skill → guild join → TCP → match).
+   **Round 2+ skips the guild join entirely** — the accounts are
+   already in the guild. The dashboard calls the same original worker
+   with `clan_override=None`, and the dashboard's guild-join targets
+   are cleared for that round, so the Homer observer never fires the
    join; the ORIGINAL bot's driver would also skip its own join step
    by its own code (`if clan_override:` guards the join at
    bd_bot.py line 27945). So round 2+ is login → TCP → match ONLY,
@@ -101,39 +103,48 @@ The dashboard is a wrapper. It does not re-implement any bot logic.
    prints nothing on its own, so app.py wraps the bot's TCP-auth
    function (`bd_bot.IIIIIllIIllIl`) with a thin observer that logs
    `[TCP-CONNECT] ID <account_id>` the first time an account's TCP
-   auth returns successfully — and, on round 1 only, fires the bot's
-   own guild join (`lllIIIIll`, with the token from the TCP-auth call
-   and the guild id) right after it, logging
-   `[GUILD-JOIN] after TCP-CONNECT: ID <account_id> -> guild <id>`.
-   The wrapper calls the original unchanged and returns its result
-   unchanged; a guild-join failure is logged and never breaks the TCP
-   auth. bd_bot.py stays byte-identical. The observer's per-account
-   set is cleared at the start of each match round, so every round
-   logs its own TCP-CONNECT lines.
+   auth returns successfully. The wrapper calls the original
+   unchanged and returns its result unchanged. bd_bot.py stays
+   byte-identical. The observer's per-account set is cleared at the
+   start of each match round, so every round logs its own
+   TCP-CONNECT lines.
+   The guild join itself is fired by a second wrapper, on the
+   Homer/roles setup (`bd_bot.lIIlIIII`, driver line 27841): right
+   after it returns True (skill 5506 equipped), on round 1 only, it
+   calls the bot's own `lllIIIIll` with `ad['token']` and the guild
+   id, logging `[GUILD-JOIN] after HOMER skill: ID <account_id> ->
+   guild <id> (result: ...)`. A guild-join failure is logged and
+   never breaks the driver flow.
    The Vercel wrapper is never called from this path — it only exists
    in the original's separate join helper, which the dashboard does
    not call.
 3. **Guild join is the original bot's own function, fired right
-   after the first TCP connect.** There is no dashboard login, no
+   after the Homer skill is equipped.** There is no dashboard login, no
    dashboard guild-join re-implementation, and no dashboard match
    code. The old `login_account` / `guild_join` (and their HTTP-400
    rule) were deleted with the rewrite they belonged to. The
-   dashboard's TCP-auth observer calls the bot's own `lllIIIIll`
-   (round 1 only) with the login token and the guild id, because the
-   bot's driver never reaches its own guild-join step — its chat TCP
-   auth hangs first. Join success/failure is whatever the original
-   bot prints in the log, plus the dashboard's own
-   `[GUILD-JOIN] after TCP-CONNECT` line. The dashboard only logs
+   dashboard's Homer observer calls the bot's own `lllIIIIll`
+   (round 1 only) with the bot's own login token and the guild id,
+   because the bot's driver never reaches its own guild-join step —
+   its chat TCP auth hangs first. Join success/failure is whatever the
+   original bot prints in the log, plus the dashboard's own
+   `[GUILD-JOIN] after HOMER skill` line. The dashboard only logs
    `[CREATED] Bot n/total | Team t | ID: <in-game account_id>` from
    our gen's own MajorLogin, `[TCP-CONNECT] ID: <account_id>` when an
    account's first lobby TCP auth succeeds, and tracks how many worker
    tasks ran to completion (`matched` on the card — the worker returns
    None whether its login/join/match succeeded or failed, so the real
    per-account outcome is in the original bot's own log lines).
-4. **Stop** — a per-guild stop cancels the running worker tasks
+4. **Stop / Remove** — a per-guild stop cancels the running worker tasks
    (bounded 30 s wait for them to unwind), starts no new match
    round, and marks the guild stopped (the card shows how many
    matches were played). Stop-all does the same for every guild.
+   Remove (✕) does all of that AND drops every account tied to that
+   guild id — the guild's accounts list is cleared when you click it
+   (logged as `[<guild>] removed: N account(s) removed`) and again
+   when its thread exits, so no account of a removed guild keeps
+   running or is kept around. The accounts are never shown in
+   /api/status.
 
 `jwt.py` is kept in the folder (our login module, MajorLogin on
 loginbp.ppmainecoonghj.com, like the emote bot) but is NOT used by the
@@ -239,13 +250,13 @@ python app.py          # dashboard at http://127.0.0.1:5000
   the first TCP auth (line 27834); its purpose for that specific call
   is unproven (it takes addresses + a starter packet, so it reads as
   lobby-connection setup, not the match start — the match join chain
-  B → D runs later, after the guild join). The TCP → guild-join order
-  is the bot's own line order (27834 < 27948); the dashboard's
-  observer restores it in practice, because the driver's own step at
-  27948 is never reached (the chat TCP auth at 27972 hangs first).
+  B → D runs later, after the guild join). The guild join now fires
+  before the first TCP connect (right after the Homer skill), because
+  the driver's own step at 27948 is never reached (the chat TCP auth
+  at 27972 hangs first).
 - The `[TCP-CONNECT]` line comes from the app.py observer wrapper
   around the bot's TCP-auth function, not from the bot itself — the
-  bot prints nothing on TCP success. The observer also fires the
-  guild join on round 1 (see above). If the wrapper ever fails to
-  install (bot has no such function), the run still works; the log
-  just won't show the TCP line.
+  bot prints nothing on TCP success. The guild join is fired by a
+  separate wrapper on the Homer setup (see above), not by the TCP
+  wrapper. If a wrapper ever fails to install (bot has no such
+  function), the run still works; the log just won't show that line.
