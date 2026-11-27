@@ -1,21 +1,22 @@
 """
-BD_IND_GLORY (ARIYANA9X) account generator — Railway web dashboard.
+SHANI VIP account generator — Railway web dashboard.
 
 - Serves a dashboard at / with a form (team size, guild IDs, region).
-- POST /api/start launches one create_bots_and_join task per guild ID, in
-  parallel (one thread + one asyncio event loop per guild).
+- POST /api/start launches one generator task per guild ID, in parallel
+  (one thread per guild; each guild uses a ThreadPoolExecutor with 70
+  workers calling our own generate_single_account).
 - GET /api/status returns per-guild progress.
 - GET /api/logs returns the last 100 log lines; GET /api/logs/stream is a
   Server-Sent Events stream that pushes new lines live.
 - POST /api/stop cancels all running guild tasks.
 
-The bot file (bd_bot.py) is imported as a module. Its entry point is guarded
-by `if __name__ == '__main__':`, so importing it does NOT start the bot.
-The bot's own behaviour (version check, account creation, accounts.json,
-guild join, reporting to the author's Vercel backend) is unchanged.
+The generator is OUR code (our_gen.py, from fast_gen.py): Garena token
+grant + MajorLogin + GetLoginData directly, no author server, no Vercel
+reporting. Guild join uses our RequestJoinClan logic (jwt.py AES key/IV)
+against clientbp directly. Importing our_gen/jwt does NOT start anything
+(both are __main__-guarded); our_gen only defines its Flask app object.
 """
 
-import asyncio
 import importlib.util
 import json
 import os
@@ -26,13 +27,28 @@ import threading
 import time
 import traceback
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+import requests
+from Crypto.Cipher import AES
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-BOT_PATH = os.path.join(APP_DIR, "bd_bot.py")
-BOT_PASSWORD = "ARIYANA9X"
+GEN_PATH = os.path.join(APP_DIR, "our_gen.py")
+JWT_PATH = os.path.join(APP_DIR, "jwt.py")
+
+# Our generator's fixed name/password prefixes (fast_gen defaults).
+NAME_PREFIX = "shani"
+PASSWORD_PREFIX = "pak"
+# 70 workers per guild, same concurrency as the old dashboard.
+GEN_WORKERS = 70
+# Stop a guild after this many consecutive generation failures.
+MAX_CONSEC_FAILURES = 10
+
+# Guild join: RequestJoinClan against clientbp directly (same logic as
+# guild_join_from_file.py; HTTP 400 = already in guild, harmless).
+REQUEST_JOIN_CLAN_URL = "https://clientbp.ppmainecoonghj.com/RequestJoinClan"
 
 LOG_MAX = 100
 MAX_TEAM_SIZE = 100
@@ -78,8 +94,8 @@ def log_line(line, guild=None):
 
 
 # ---------------------------------------------------------------------------
-# stdout capture: the bot prints via print(); capture it into the log buffer.
-# Each bot thread is registered to a guild id so lines get tagged correctly.
+# stdout capture: the generator prints via print(); capture it into the log
+# buffer. Each guild thread is registered to a guild id so lines get tagged.
 # ---------------------------------------------------------------------------
 
 _orig_stdout = sys.stdout
@@ -133,49 +149,103 @@ def _log(msg, guild=None):
 
 
 # ---------------------------------------------------------------------------
-# Bot module (lazy import — importing takes a few seconds for a 5.5 MB file)
+# Generator modules (lazy import — importing our_gen builds its IP/device/
+# UA pools, which prints a few lines and takes a few seconds)
 # ---------------------------------------------------------------------------
 
-_bot_module = None
-_bot_lock = threading.Lock()
-_bot_error = None
+_gen = None        # (our_gen module, jwt module)
+_gen_lock = threading.Lock()
+_gen_error = None
 
 
-def _sanitize_no_proxy():
-    """httpx 0.28 crashes on bracketed IPv6 entries (e.g. [::1]) in no_proxy
-    (InvalidURL: Invalid port: ':1]'). The bot builds an httpx.AsyncClient
-    at import time, so strip those entries before importing it. This only
-    affects the proxy-bypass list; outbound proxying itself is unchanged.
-    Railway's environment has no such entries, so this is a no-op there."""
-    for key in ("no_proxy", "NO_PROXY"):
-        val = os.environ.get(key)
-        if not val:
-            continue
-        kept = [e for e in val.split(",") if "[" not in e]
-        if len(kept) != len(val.split(",")):
-            os.environ[key] = ",".join(kept)
-            _log(f"[dashboard] removed bracketed IPv6 entries from {key} (httpx workaround)")
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def get_bot():
-    global _bot_module, _bot_error
-    if _bot_module is not None:
-        return _bot_module
-    if _bot_error is not None:
-        raise RuntimeError(f"bot failed to import earlier: {_bot_error}")
-    with _bot_lock:
-        if _bot_module is not None:
-            return _bot_module
-        _sanitize_no_proxy()
-        _log("[dashboard] importing bot module (this takes a few seconds)...")
-        spec = importlib.util.spec_from_file_location("bd_bot", BOT_PATH)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)  # safe: entry point is __main__-guarded
-        if not hasattr(mod, "create_bots_and_join"):
-            raise RuntimeError("bot module has no create_bots_and_join")
-        _bot_module = mod
-        _log("[dashboard] bot module imported OK")
-        return _bot_module
+def get_gen():
+    """Return (our_gen, jwtmod), importing once. Safe: neither module runs
+    anything on import (both are __main__-guarded)."""
+    global _gen, _gen_error
+    if _gen is not None:
+        return _gen
+    if _gen_error is not None:
+        raise RuntimeError(f"generator failed to import earlier: {_gen_error}")
+    with _gen_lock:
+        if _gen is not None:
+            return _gen
+        try:
+            _log("[dashboard] importing generator modules (this takes a few seconds)...")
+            jwtmod = _load_module("dashboard_jwt", JWT_PATH)
+            our_gen = _load_module("our_gen", GEN_PATH)
+            if not hasattr(our_gen, "generate_single_account"):
+                raise RuntimeError("our_gen has no generate_single_account")
+            if not hasattr(jwtmod, "AES_KEY") or not hasattr(jwtmod, "AES_IV"):
+                raise RuntimeError("jwt module has no AES_KEY/AES_IV")
+            _gen = (our_gen, jwtmod)
+            _log("[dashboard] generator modules imported OK")
+            return _gen
+        except Exception as exc:  # noqa: BLE001 - remember the failure
+            _gen_error = exc
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Guild join (RequestJoinClan) — copied logic from guild_join_from_file.py.
+# The generated account's jwt_token is the Bearer token; protobuf is
+# {f1=guild_id, f2="PK"}, AES-CBC with jwt.py's key/IV.
+# ---------------------------------------------------------------------------
+
+def _varint(n):
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            break
+    return bytes(out)
+
+
+def _pad(data):
+    pad_len = 16 - (len(data) % 16)
+    return data + bytes([pad_len]) * pad_len
+
+
+def guild_join(jwtmod, jwt_token, guild_id):
+    """Send RequestJoinClan for one generated account.
+
+    Returns (ok, status): ok True on HTTP 200; status is the HTTP code or
+    an error string. HTTP 400 = already in that guild (harmless).
+    """
+    if not jwt_token:
+        return False, "no jwt_token"
+    proto = b"\x08" + _varint(int(guild_id)) + b"\x12\x02PK"
+    body = AES.new(jwtmod.AES_KEY, AES.MODE_CBC, jwtmod.AES_IV).encrypt(
+        _pad(proto))
+    headers = {
+        "Authorization": "Bearer " + jwt_token,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "ReleaseVersion": "OB55",
+        "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+        "X-GA": "v1 1",
+        "X-GA-SV": str(int(time.time())),
+        "X-Unity-Version": "2018.4.12f1",
+    }
+    try:
+        r = requests.post(REQUEST_JOIN_CLAN_URL, data=body,
+                          headers=headers, timeout=20)
+        return (r.status_code == 200), r.status_code
+    except Exception as e:  # noqa: BLE001 - report as a join failure
+        return False, str(e)
+
+
+class _GuildFailed(Exception):
+    """Raised when a guild run must stop with an error state."""
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +255,7 @@ def get_bot():
 # guild_id -> {
 #   "guild_id", "state": "running"|"done"|"error"|"stopped",
 #   "created": int, "total": int, "started_at": str, "ended_at": str|None,
-#   "error": str|None, "thread": Thread|None, "loop": loop|None, "task": Task|None,
+#   "error": str|None, "thread": Thread|None, "stop_event": Event|None,
 # }
 _guilds = {}
 _guilds_lock = threading.Lock()
@@ -214,35 +284,92 @@ log_line = _counting_log_line
 
 
 def _run_guild(guild_id, team_size, region):
-    """Runs create_bots_and_join for one guild in its own thread + event loop."""
+    """Generates team_size accounts for one guild with 70 workers, then
+    joins each one to the guild. Runs in its own thread; one thread per
+    guild, so multiple guilds run in parallel."""
     with _thread_guild_lock:
         _thread_guild[threading.get_ident()] = guild_id
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    task = None
+    stop_event = threading.Event()
+    with _guilds_lock:
+        _guilds[guild_id]["stop_event"] = stop_event
+    created = 0
+    consecutive_failures = 0
     try:
-        bot = get_bot()
-        with _guilds_lock:
-            _guilds[guild_id]["loop"] = loop
-        _log(f"[{guild_id}] starting: {team_size} accounts, region {region}", guild=guild_id)
-        coro = bot.create_bots_and_join(region, guild_id, count=team_size, password=BOT_PASSWORD)
-        task = loop.create_task(coro)
-        with _guilds_lock:
-            _guilds[guild_id]["task"] = task
-        loop.run_until_complete(task)
+        our_gen, jwtmod = get_gen()
+        _log(f"[{guild_id}] starting: {team_size} accounts, region {region} "
+             f"(our generator, 70 workers)", guild=guild_id)
+        # Work in waves: each wave submits up to 70 generation attempts
+        # (never more than the accounts still needed), waits for them all,
+        # counts the successes, and retries the failures in the next wave.
+        while created < team_size and not stop_event.is_set():
+            remaining = team_size - created
+            batch = min(GEN_WORKERS, remaining)
+            ex = ThreadPoolExecutor(max_workers=GEN_WORKERS)
+            try:
+                futs = [ex.submit(our_gen.generate_single_account, region,
+                                  NAME_PREFIX, PASSWORD_PREFIX)
+                        for _ in range(batch)]
+                for fut in as_completed(futs):
+                    if stop_event.is_set():
+                        break
+                    try:
+                        acc = fut.result()
+                    except Exception as exc:  # noqa: BLE001 - one bad attempt
+                        acc = None
+                        _log(f"[{guild_id}] generation error: "
+                             f"{type(exc).__name__}: {exc}", guild=guild_id)
+                    if not acc:
+                        consecutive_failures += 1
+                        _log(f"[{guild_id}] account failed "
+                             f"({consecutive_failures} consecutive)",
+                             guild=guild_id)
+                        if consecutive_failures >= MAX_CONSEC_FAILURES:
+                            raise _GuildFailed(
+                                f"{MAX_CONSEC_FAILURES} consecutive "
+                                f"generation failures")
+                        continue
+                    consecutive_failures = 0
+                    created += 1
+                    uid = acc.get("uid")
+                    _log(f"[CREATED] Bot {created}/{team_size} | UID: {uid}",
+                         guild=guild_id)
+                    # Join this account to the guild. A join failure does
+                    # NOT stop generation of the remaining accounts.
+                    ok, status = guild_join(jwtmod, acc.get("jwt_token"),
+                                            guild_id)
+                    if ok:
+                        _log(f"[JOINED] UID {uid} -> guild {guild_id}",
+                             guild=guild_id)
+                    elif status == 400:
+                        _log(f"[JOINED] UID {uid} -> guild {guild_id} "
+                             f"(already in guild)", guild=guild_id)
+                    else:
+                        _log(f"[JOIN-FAIL] UID {uid} -> guild {guild_id}: "
+                             f"{status}", guild=guild_id)
+            finally:
+                # On stop, drop queued futures immediately; running attempts
+                # finish in the background and their results are discarded.
+                ex.shutdown(wait=False, cancel_futures=True)
         with _guilds_lock:
             g = _guilds[guild_id]
             if g["state"] == "running":
-                g["state"] = "done"
+                if stop_event.is_set():
+                    g["state"] = "stopped"
+                    _log(f"[{guild_id}] stopped by user "
+                         f"({created}/{team_size} created)", guild=guild_id)
+                else:
+                    g["state"] = "done"
+                    _log(f"[{guild_id}] done: {created}/{team_size} created",
+                         guild=guild_id)
                 g["ended_at"] = _now_iso()
-        _log(f"[{guild_id}] done: { _guilds[guild_id]['created']}/{team_size} created", guild=guild_id)
-    except asyncio.CancelledError:
+    except _GuildFailed as exc:
         with _guilds_lock:
             g = _guilds[guild_id]
-            g["state"] = "stopped"
+            g["state"] = "error"
+            g["error"] = str(exc)
             g["ended_at"] = _now_iso()
-        _log(f"[{guild_id}] stopped by user", guild=guild_id)
-    except Exception as exc:  # noqa: BLE001 - surface any bot failure per guild
+        _log(f"[{guild_id}] ERROR: {exc}", guild=guild_id)
+    except Exception as exc:  # noqa: BLE001 - surface any failure per guild
         with _guilds_lock:
             g = _guilds[guild_id]
             g["state"] = "error"
@@ -253,10 +380,6 @@ def _run_guild(guild_id, team_size, region):
     finally:
         with _thread_guild_lock:
             _thread_guild.pop(threading.get_ident(), None)
-        try:
-            loop.close()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
@@ -302,11 +425,11 @@ def api_start():
     if region not in ("BD", "IND"):
         return jsonify({"ok": False, "error": "region must be BD or IND"}), 400
 
-    # ---- check the bot imports before starting anything ----
+    # ---- check the generator imports before starting anything ----
     try:
-        get_bot()
+        get_gen()
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"ok": False, "error": f"bot failed to load: {exc}"}), 500
+        return jsonify({"ok": False, "error": f"generator failed to load: {exc}"}), 500
 
     started = []
     skipped = []
@@ -325,14 +448,13 @@ def api_start():
                 "ended_at": None,
                 "error": None,
                 "thread": None,
-                "loop": None,
-                "task": None,
+                "stop_event": None,
             }
             started.append(gid)
 
     for gid in started:
         t = threading.Thread(target=_run_guild, args=(gid, team_size, region),
-                             name=f"bot-{gid}", daemon=True)
+                             name=f"gen-{gid}", daemon=True)
         with _guilds_lock:
             _guilds[gid]["thread"] = t
         t.start()
@@ -403,14 +525,10 @@ def api_stop():
     with _guilds_lock:
         running = [g for g in _guilds.values() if g["state"] == "running"]
     for g in running:
-        loop = g.get("loop")
-        task = g.get("task")
-        if loop is not None and task is not None:
-            try:
-                loop.call_soon_threadsafe(task.cancel)
-                stopped.append(g["guild_id"])
-            except Exception:
-                pass
+        ev = g.get("stop_event")
+        if ev is not None:
+            ev.set()
+            stopped.append(g["guild_id"])
     return jsonify({"ok": True, "stopped": stopped})
 
 

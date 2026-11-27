@@ -1,30 +1,46 @@
-# ARIYANA9X — Account Generator Dashboard (Railway)
+# SHANI VIP — Account Generator Dashboard (Railway)
 
-A web dashboard for the BD_IND_GLORY Free Fire account generator bot.
-No terminal prompts, no Skip option — everything runs from the dashboard.
+A web dashboard for our own Free Fire account generator (the one from the
+emote bot / fast_gen). No terminal prompts, no Skip option — everything runs
+from the dashboard.
 
 ## What it does
 
 - **Team size** — how many accounts to create per guild (1–100, default 4).
 - **Guild IDs** — one per line; multiple guilds run **in parallel**, each with
   its own progress card.
-- **Region** — BD or IND.
+- **Region** — BD or IND (passed to the generator; name prefix `shani`,
+  password prefix `pak`).
 - **Live log** — the last 100 lines, streamed in real time (Server-Sent Events),
   auto-scrolling, tagged per guild.
 - **Per-guild progress** — created/total with a progress bar, state
   (running / done / error / stopped).
 - **Stop all** — cancels every running guild task.
 
-The bot itself is unchanged: it does its own version check, creates the
-accounts (up to 70 at a time), saves `accounts.json`, and joins them to the
-guild. It also reports the created accounts to the author's backend
-(`ariyan-join-a9x.vercel.app/join`) — that is the bot's own behaviour.
+## Our generator (not the BD bot)
+
+The old dashboard ran the BD_IND_GLORY (ARIYANA9X) bot, which did its version
+check against the author's server and reported every created account to the
+author's backend. This version replaces it with **our own generator**:
+
+- `our_gen.py` — our `fast_gen.py`, unchanged: guest register → Garena token
+  grant → MajorRegister → MajorLogin → GetLoginData, all against Garena
+  directly. No author server, nothing reported to anyone.
+- `jwt.py` — our login module (MajorLogin / GetLoginData / AES), unchanged.
+- Guild join is our own `RequestJoinClan` (AES-CBC protobuf
+  `{f1=guild_id, f2="PK"}`, Bearer JWT) against clientbp directly.
+  HTTP 400 = already in that guild, treated as joined.
+- Each guild runs with **70 workers**. A failed attempt is retried; a guild
+  stops with an error after 10 consecutive failures. A join failure never
+  stops generation of the remaining accounts.
+- Accounts are only shown in the log (`[CREATED] Bot n/total | UID: ...`,
+  `[JOINED] UID ... -> guild ...`). Nothing is saved to disk.
 
 ## Deploy on Railway
 
 1. Push this folder to a GitHub repo (or use Railway's "Deploy from GitHub").
-   - `bd_bot.py` is part of the app — it is **never served to the browser**
-     and never logged. Keep the repo private.
+   - `our_gen.py` and `jwt.py` are part of the app — they are **never served
+     to the browser** and never logged. Keep the repo private.
 2. In Railway: **New Project → Deploy from GitHub repo** → pick the repo.
    Railway detects the `Dockerfile` automatically (`railway.json` pins it).
 3. No environment variables are needed. Railway sets `$PORT` itself.
@@ -33,6 +49,11 @@ guild. It also reports the created accounts to the author's backend
 
 That is it — no build command, no start command, no env vars.
 
+To redeploy after an update: push the new files to the same repo — Railway
+auto-redeploys from the repo. (If the repo was set up with the old BD-bot
+version, the old `bd_bot.py` and its helper files are now gone; Railway
+rebuilds from the Dockerfile, so the deleted files do not linger.)
+
 ## Use the dashboard
 
 1. Enter **Team size** (accounts per guild).
@@ -40,10 +61,6 @@ That is it — no build command, no start command, no env vars.
 3. Pick **Region** (BD / IND).
 4. Press **Start**. Each guild gets its own progress card; the log streams live.
 5. Press **Stop all** to cancel running guilds.
-
-Accounts are saved to `accounts.json` inside the Railway container
-(ephemeral — download it from Railway's volume/shell if you need to keep it,
-or attach a Railway Volume mounted at `/app`).
 
 ## Run locally (optional)
 
@@ -55,11 +72,10 @@ python app.py          # dashboard at http://127.0.0.1:5000
 
 ## Files
 
-- `app.py` — Flask app (dashboard + API + log capture + per-guild runners).
-- `bd_bot.py` — the deobfuscated bot (imported as a module, never edited).
-- `homor_rudp.py`, `message_ids.py`, `StartMatch_pb2.py`, `data_pb2.py`,
-  `reqClan_pb2.py`, `thunderFF_pb2.py` — the bot's own helper modules from
-  the original zip (required at import time; do not remove).
+- `app.py` — Flask app (dashboard + API + log capture + per-guild runners
+  + RequestJoinClan).
+- `our_gen.py` — our account generator (fast_gen, unchanged logic).
+- `jwt.py` — our login module (unchanged).
 - `templates/index.html` — the dashboard (inline CSS/JS, no CDN).
 - `requirements.txt`, `Dockerfile`, `railway.json`.
 
